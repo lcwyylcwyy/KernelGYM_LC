@@ -58,7 +58,9 @@ COVERAGE_REWARD_WEIGHT=${COVERAGE_REWARD_WEIGHT:-0.25}
 COVERAGE_REWARD_ENABLE=${COVERAGE_REWARD_ENABLE:-False}
 
 ENABLE_TWO_GATE_FILTER=${ENABLE_TWO_GATE_FILTER:-False}
+GATE1_ENABLED=${GATE1_ENABLED:-True}
 GATE1_BIAS_EPSILON=${GATE1_BIAS_EPSILON:-0.01}
+GATE2_ENABLED=${GATE2_ENABLED:-True}
 GATE2_INSTABILITY_THRESHOLD=${GATE2_INSTABILITY_THRESHOLD:--15.0}
 LOG_REJECTED_SAMPLES=${LOG_REJECTED_SAMPLES:-False}
 SAVE_REJECTION_STATS=${SAVE_REJECTION_STATS:-True}
@@ -131,6 +133,8 @@ SPEEDUP_THRESHOLD=${SPEEDUP_THRESHOLD:-null}
 
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-4096}
+FILTER_OVERLONG_PROMPTS=${FILTER_OVERLONG_PROMPTS:-True}
+DATA_TRUNCATION=${DATA_TRUNCATION:-error}
 LEARNING_RATE=${LEARNING_RATE:-1e-6}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-32}     # Mini-batch size for PPO updates
 PPO_MICRO_TOKEN=${PPO_MICRO_TOKEN:-null}           # Auto-calculated based on model size
@@ -201,6 +205,7 @@ REWARD_TASK_TIMEOUT=${REWARD_TASK_TIMEOUT:-600}
 REWARD_TASK_TIMEOUT_CLIENT=${REWARD_TASK_TIMEOUT_CLIENT:-2400}
 REWARD_PRINT_STATUS=${REWARD_PRINT_STATUS:-True}
 NUM_PERF_TRIALS=${NUM_PERF_TRIALS:-100}
+REFERENCE_BACKEND=${REFERENCE_BACKEND:-torch_compile}
 
 # Optional dump directories
 ROLLOUT_DATA_DIR=${ROLLOUT_DATA_DIR:-""}
@@ -226,6 +231,52 @@ SAMPLE_SELECTION_STRATEGY=${SAMPLE_SELECTION_STRATEGY:-efficiency_stochastic}  #
 ROLLOUT_MODE=${ROLLOUT_MODE:-"async_vllm"}
 
 CALCULATE_LOG_PROBS=${CALCULATE_LOG_PROBS:-True}
+
+if [ -n "${WANDB_API_KEY:-}" ]; then
+  DEFAULT_TRAIN_LOGGERS="['console','wandb']"
+else
+  DEFAULT_TRAIN_LOGGERS="['console']"
+fi
+TRAIN_LOGGERS=${TRAIN_LOGGERS:-$DEFAULT_TRAIN_LOGGERS}
+TRAIN_LOGGERS=${TRAIN_LOGGERS// /}
+PRECHECK_REWARD_SERVER=${PRECHECK_REWARD_SERVER:-True}
+
+normalize_rollout_settings() {
+  if [[ "$ROLLOUT_MODE" == "async_vllm" && "${FREE_CACHE_ENGINE,,}" != "true" ]]; then
+    echo "Enabling FREE_CACHE_ENGINE for async_vllm rollout compatibility"
+    FREE_CACHE_ENGINE=True
+  fi
+}
+
+precheck_reward_server() {
+  if [[ "${PRECHECK_REWARD_SERVER,,}" != "true" ]]; then
+    return 0
+  fi
+
+  if [[ "$REWARD_MANAGER" != "kernel_async" ]]; then
+    return 0
+  fi
+
+  if [[ -z "$REWARD_SERVER_URL" ]]; then
+    echo "Warning: REWARD_SERVER_URL is empty; skipping reward server precheck"
+    return 0
+  fi
+
+  local curl_bin
+  curl_bin=$(command -v curl || true)
+  if [[ -z "$curl_bin" ]]; then
+    echo "Warning: curl not found; skipping reward server precheck for $REWARD_SERVER_URL"
+    return 0
+  fi
+
+  local health_url="${REWARD_SERVER_URL%/}/health"
+  echo "Prechecking reward server health: $health_url"
+  if ! "$curl_bin" -fsS --max-time 10 "$health_url" >/dev/null; then
+    echo "Error: reward server is not reachable at $health_url"
+    echo "Hint: verify KERNELGYM_SERVER_URL or export PRECHECK_REWARD_SERVER=False to bypass the shell-level precheck"
+    return 1
+  fi
+}
 
 generate_model_micro_token() {
   local model_name=$1
@@ -416,6 +467,7 @@ parse_arguments() {
       --train_dataset) TRAIN_DATASET=($2); shift 2 ;;
       --valid_dataset) VALID_DATASET=($2); shift 2 ;;
       --model_name) MODEL_NAME="$2"; shift 2 ;;
+      --model_path) MODEL_PATH="$2"; shift 2 ;;
       --use_prioritized_sampling) USE_PRIORITIZED_SAMPLING="$2"; shift 2 ;;
       --automatic_oversampling) AUTOMATIC_OVERSAMPLING="$2"; shift 2 ;;
       --use_moderate_sampling) USE_MODERATE_SAMPLING="$2"; shift 2 ;;
@@ -433,6 +485,7 @@ parse_arguments() {
       --reward_max_retries) REWARD_MAX_RETRIES="$2"; shift 2 ;;
       --reward_task_timeout) REWARD_TASK_TIMEOUT="$2"; shift 2 ;;
       --reward_print_status) REWARD_PRINT_STATUS="$2"; shift 2 ;;
+      --reference_backend) REFERENCE_BACKEND="$2"; shift 2 ;;
       --reward_weights) REWARD_WEIGHTS="$2"; shift 2 ;;
       --reward_policy) REWARD_POLICY="$2"; shift 2 ;;
       --rollout_data_dir) ROLLOUT_DATA_DIR="$2"; shift 2 ;;
@@ -453,10 +506,15 @@ parse_arguments() {
       --rollout_is_kwargs) ROLLOUT_IS_KWARGS="$2"; shift 2 ;;
       --rollout_rs_kwargs) ROLLOUT_RS_KWARGS="$2"; shift 2 ;;
       --rollout_token_veto_threshold) ROLLOUT_TOKEN_VETO_THRESHOLD="$2"; shift 2 ;;
+      --filter_overlong_prompts) FILTER_OVERLONG_PROMPTS="$2"; shift 2 ;;
+      --data_truncation) DATA_TRUNCATION="$2"; shift 2 ;;
       --enable_multi_turn) ENABLE_MULTI_TURN="$2"; shift 2 ;;
       --max_turn) MAX_TURN="$2"; shift 2 ;;
       --val_before_train) VAL_BEFORE_TRAIN="$2"; shift 2 ;;
       --is_get_last_turn) IS_GET_LAST_TURN="$2"; shift 2 ;;
+      --free_cache_engine) FREE_CACHE_ENGINE="$2"; shift 2 ;;
+      --enforce_eager) ENFORCE_EAGER="$2"; shift 2 ;;
+      --train_loggers) TRAIN_LOGGERS="${2// /}"; shift 2 ;;
       --speedup_reward_upper_bound) SPEEDUP_REWARD_UPPER_BOUND="$2"; shift 2 ;;
       --speedup_reward_lower_bound) SPEEDUP_REWARD_LOWER_BOUND="$2"; shift 2 ;;
       --reward_shaping) REWARD_SHAPING="$2"; shift 2 ;;
@@ -581,6 +639,8 @@ format_dataset_paths() {
 }
 
 setup_training_environment() {
+  normalize_rollout_settings
+
   # Build dataset name string for run name
   if [ ${#TRAIN_DATASET[@]} -gt 0 ]; then
     for dataset in "${TRAIN_DATASET[@]}"; do
@@ -645,8 +705,13 @@ setup_training_environment() {
   echo "Model Path: $MODEL_PATH_RESOLVED"
   echo "Checkpoint Dir: $CHECKPOINT_DIR"
   echo "GPUs per Node: $N_GPUS_PER_NODE"
+  echo "Python Executable: ${DRKERNEL_PYTHON:-python}"
+  echo "Train Loggers: $TRAIN_LOGGERS"
+  echo "Filter Overlong Prompts: $FILTER_OVERLONG_PROMPTS"
+  echo "Data Truncation: $DATA_TRUNCATION"
   echo "Remove Clip: $REMOVE_CLIP"
   echo "Reward Manager: $REWARD_MANAGER"
+  echo "Reference Backend: $REFERENCE_BACKEND"
   echo "Automatic Oversampling: $AUTOMATIC_OVERSAMPLING"
   echo "Moderate Sampling: $USE_MODERATE_SAMPLING"
   echo "Refresh Sampling: $USE_REFRESH_SAMPLING"
@@ -687,9 +752,10 @@ setup_training_environment() {
 }
 
 run_training() {
+  precheck_reward_server || return 1
   sleep 3
 
-  PYTHONUNBUFFERED=1 python -m kernel.main_kernel \
+  PYTHONUNBUFFERED=1 "${DRKERNEL_PYTHON:-python}" -m kernel.main_kernel \
       trainer.val_before_train=$VAL_BEFORE_TRAIN \
       algorithm.adv_estimator=$ALGORITHM \
       algorithm.is_get_last_turn=$IS_GET_LAST_TURN \
@@ -700,6 +766,8 @@ run_training() {
       data.val_sample_size=$VAL_SAMPLE_SIZE \
       data.max_prompt_length=$MAX_PROMPT_LENGTH \
       data.max_response_length=$MAX_RESPONSE_LENGTH \
+      data.filter_overlong_prompts=$FILTER_OVERLONG_PROMPTS \
+      data.truncation=$DATA_TRUNCATION \
       data.apply_chat_template=$APPLY_CHAT_TEMPLATE \
       data.use_prioritized_sampling=$USE_PRIORITIZED_SAMPLING \
       data.update_success_rates_every=1 \
@@ -765,6 +833,7 @@ run_training() {
       actor_rollout_ref.ref.ulysses_sequence_parallel_size=$SP_SIZE\
       reward_model.enable=False \
       reward_model.reward_manager=$REWARD_MANAGER \
+      ++reward_model.reference_backend=$REFERENCE_BACKEND \
       reward_model.enhanced=$REWARD_ENHANCED \
       reward_model.use_sandbox_rate_limit=$REWARD_USE_SANDBOX_RATE_LIMIT \
       reward_model.server_url='"'$REWARD_SERVER_URL'"' \
@@ -800,7 +869,7 @@ run_training() {
       algorithm.gamma=$GAMMA \
       critic.ppo_micro_batch_size_per_gpu=4 \
       trainer.critic_warmup=0 \
-      trainer.logger=['console','wandb'] \
+      trainer.logger=$TRAIN_LOGGERS \
       trainer.rejection_sample=$REJECTION_SAMPLE \
       trainer.project_name=$PROJECT_NAME \
       trainer.experiment_name=$RUN_NAME \
