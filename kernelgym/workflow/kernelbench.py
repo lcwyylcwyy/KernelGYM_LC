@@ -148,6 +148,8 @@ class KernelBenchWorkflowController(WorkflowController):
                         priority=eval_task.priority,
                         entry_point=eval_task.entry_point,
                         reference_backend=eval_task.reference_backend,
+                        return_reference_triton=eval_task.return_reference_triton,
+                        reference_triton_max_chars=eval_task.reference_triton_max_chars,
                         device_preference=eval_task.device_preference,
                     )
 

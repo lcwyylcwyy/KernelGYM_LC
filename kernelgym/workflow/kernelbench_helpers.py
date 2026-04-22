@@ -66,6 +66,8 @@ def _create_paired_tasks(
                 priority=task.priority,
                 entry_point=task.entry_point,
                 reference_backend=task.reference_backend,
+                return_reference_triton=task.return_reference_triton,
+                reference_triton_max_chars=task.reference_triton_max_chars,
                 device_preference=task.device_preference,
                 resources=task.resources,
             )
@@ -83,6 +85,8 @@ def _create_paired_tasks(
             priority=task.priority,
             entry_point=task.entry_point,
             reference_backend=task.reference_backend,
+            return_reference_triton=task.return_reference_triton,
+            reference_triton_max_chars=task.reference_triton_max_chars,
             device_preference=task.device_preference,
             resources=task.resources,
         )

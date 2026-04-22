@@ -210,6 +210,8 @@ class KernelBenchToolkit(Toolkit):
                 device=device,
                 entry_point=task.entry_point,
                 reference_backend=task.reference_backend,
+                return_reference_triton=task.return_reference_triton,
+                reference_triton_max_chars=task.reference_triton_max_chars,
                 backend_adapter=backend_adapter,
             )
             reference_runtime = ref_exec_result.runtime

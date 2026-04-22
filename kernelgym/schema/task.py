@@ -32,6 +32,8 @@ class EvaluationTask:
     run_correctness: Optional[bool] = None
     run_triton_detection: Optional[bool] = None
     run_performance: Optional[bool] = None
+    return_reference_triton: bool = False
+    reference_triton_max_chars: int = 120000
     resources: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -59,6 +61,8 @@ class ReferenceTimingTask:
     entry_point: str = "Model"
     reference_backend: Optional[str] = None
     device_preference: Optional[str] = None
+    return_reference_triton: bool = False
+    reference_triton_max_chars: int = 120000
     resources: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
