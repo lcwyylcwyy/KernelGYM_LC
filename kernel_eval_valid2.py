@@ -7,6 +7,7 @@ import httpx
 
 DEFAULT_SERVER_URLS = (
     os.getenv("KERNELGYM_SERVER_URL"),
+    "http://192.168.31.68:8001",
     "http://192.168.31.68:8003",
     "http://localhost:10907",
 )
@@ -32,9 +33,9 @@ async def resolve_server_url() -> str:
     )
 
 
-async def evaluate_kernelbench():
+async def evaluate_reference_triton():
     server_url = await resolve_server_url()
-    task_id = f"softmax-kernel-{uuid4().hex[:8]}"
+    task_id = f"softmax-ref-{uuid4().hex[:8]}"
     reference_code = '''
 import torch
 
@@ -52,39 +53,17 @@ def get_inputs():
     return [torch.randn(32, 512, device='cuda')]
 '''
 
+    # Minimal kernel stub: must be non-empty and correct, otherwise kernelbench
+    # stops before running reference timing.
     kernel_code = '''
 import torch
-import triton
-import triton.language as tl
-
-@triton.jit
-def softmax_kernel(input_ptr, output_ptr, n_cols, BLOCK_SIZE: tl.constexpr):
-    row_idx = tl.program_id(0)
-    col_offsets = tl.arange(0, BLOCK_SIZE)
-    mask = col_offsets < n_cols
-
-    row_start = row_idx * n_cols
-    input_ptrs = input_ptr + row_start + col_offsets
-
-    row = tl.load(input_ptrs, mask=mask, other=-float('inf'))
-    row_max = tl.max(row, axis=0)
-    numerator = tl.exp(row - row_max)
-    denominator = tl.sum(numerator, axis=0)
-    softmax_output = numerator / denominator
-
-    output_ptrs = output_ptr + row_start + col_offsets
-    tl.store(output_ptrs, softmax_output, mask=mask)
 
 class ModelNew(torch.nn.Module):
     def __init__(self):
         super().__init__()
 
     def forward(self, x):
-        n_rows, n_cols = x.shape
-        output = torch.empty_like(x)
-        BLOCK_SIZE = triton.next_power_of_2(n_cols)
-        softmax_kernel[(n_rows,)](x, output, n_cols, BLOCK_SIZE=BLOCK_SIZE)
-        return output
+        return torch.softmax(x, dim=-1)
 
 def get_init_inputs():
     return []
@@ -99,37 +78,133 @@ def get_inputs():
         response = await client.post(
             f"{server_url}/evaluate",
             json={
+                "force_refresh": True,
                 "task_id": task_id,
                 "reference_code": reference_code,
-                "reference_backend": "torch_compile",
-                "return_reference_triton": True,
-                "reference_triton_max_chars": 80000,
                 "kernel_code": kernel_code,
                 "entry_point": "Model",
                 "backend": "triton",
+                "device_preference": "cuda:0",
+                "reference_backend": "torch_compile",
+                "return_reference_triton": True,
+                "reference_triton_max_chars": 80000,
                 "num_correct_trials": 5,
                 "num_perf_trials": 100,
-                "force_refresh": True,
+                "run_triton_detection": False,
             }
         )
         response.raise_for_status()
-        return response.json(), kernel_code
+        return response.json()
 
 
-result, kernel_code = asyncio.run(evaluate_kernelbench())
-print(f"Compiled: {result['compiled']}")
-print(f"Correctness: {result['correctness']}")
-print(f"Speedup: {result['speedup']:.2f}x")
-print(f"Reference Runtime: {result['reference_runtime']:.4f} ms")
-print(f"Kernel Runtime: {result['kernel_runtime']:.4f} ms")
+def _clean_reference_triton_output(raw_code: str) -> str:
+    if not raw_code:
+        return raw_code
 
-metadata = result.get("metadata") or {}
+    # The capture sometimes includes a duplicated kernel section split by this marker.
+    marker = "\n# ---- triton-kernel ----\n"
+    if marker in raw_code:
+        raw_code = raw_code.split(marker, 1)[0].rstrip()
+
+    return raw_code
+
+
+def _extract_kernel_definition(code: str) -> str:
+    """Extract just the @triton.jit kernel definition."""
+    if not code:
+        return ""
+    if "@triton.jit" in code:
+        start = code.find("@triton.jit")
+        # Find the end of the function (next def or end of string)
+        rest = code[start:]
+        lines = rest.split('\n')
+        
+        # Collect until we hit another function or key markers
+        result_lines = []
+        indent_level = None
+        for line in lines:
+            stripped = line.lstrip()
+            if stripped.startswith('def ') and result_lines:
+                # Check if this is same level indent as @triton.jit decorator
+                current_indent = len(line) - len(stripped)
+                if current_indent == 0:
+                    # New top-level function, stop here
+                    break
+            result_lines.append(line)
+        
+        return '\n'.join(result_lines).rstrip()
+    return code
+
+
+def _extract_invocation_code(code: str) -> str:
+    """Extract the kernel invocation/launch code."""
+    if not code:
+        return ""
+    
+    invocation_parts = []
+    lines = code.split('\n')
+    
+    # Look for grid definition and kernel.run() calls
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        # Capture grid definitions, launch parameters, and kernel calls
+        if any(marker in stripped for marker in [
+            'grid =', 'grid0 =', 'grid1 =',
+            '.run(', '.call(', '.launch(',
+            'cooperative_groups'
+        ]) or ('triton_' in stripped and '(' in stripped):
+            invocation_parts.append(line)
+        # Also capture following lines that are continuations
+        if invocation_parts and i > 0:
+            prev_line = lines[i-1].rstrip()
+            if prev_line.endswith('(') or prev_line.endswith(','):
+                invocation_parts.append(line)
+    
+    if not invocation_parts:
+        # Fallback: look for any lines after the kernel definition
+        in_kernel = False
+        for line in lines:
+            if '@triton.jit' in line or 'def triton_' in line:
+                in_kernel = True
+                continue
+            if in_kernel and line.strip() and not line.strip().startswith('def '):
+                if '@triton.jit' not in line and 'libdevice' not in line:
+                    invocation_parts.append(line)
+            elif in_kernel and line.strip().startswith('def ') and 'def triton_' not in line:
+                # End of kernel, rest is likely invocation
+                in_kernel = False
+    
+    return '\n'.join(invocation_parts).strip() if invocation_parts else ""
+
+
+workflow_response = asyncio.run(evaluate_reference_triton())
+print(f"Status: {workflow_response.get('status')}")
+print(f"Reference Runtime: {workflow_response['reference_runtime']:.4f} ms")
+
+metadata = workflow_response.get("metadata") or {}
 ref_triton = metadata.get("reference_triton_code", "")
-if ref_triton:
-    print("\n=== Reference Generated Triton Code (head) ===")
-    print(ref_triton)
+ref_triton_full = metadata.get("reference_triton_full_context", "")
+
+if ref_triton or ref_triton_full:
+    print("\n" + "="*70)
+    print("=== Reference Generated Triton Kernel Definition ===")
+    print("="*70)
+    cleaned = _clean_reference_triton_output(ref_triton)
+    print(cleaned)
+    
+    print("\n" + "="*70)
+    print("=== Reference Triton Invocation Code ===")
+    print("="*70)
+    if ref_triton_full:
+        invocation = _extract_invocation_code(ref_triton_full)
+        if invocation:
+            print(invocation)
+        else:
+            print("[Invocation code not clearly separable from definition]")
+            print("Full context:")
+            print(ref_triton_full[:2000])  # Show first 2000 chars
+    else:
+        print("[Full context not available in this capture]")
 else:
-    print(
-        "\nNo reference Triton code captured. "
-        "Check metadata and server logs."
-    )
+    print("\nNo reference Triton code captured. Metadata:")
+    print(metadata)
