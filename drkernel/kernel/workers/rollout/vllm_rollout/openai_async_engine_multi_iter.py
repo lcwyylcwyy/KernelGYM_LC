@@ -48,7 +48,10 @@ from vllm.inputs import TokensPrompt
 from vllm.outputs import RequestOutput
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.executor.abstract import Executor
-from vllm.worker.worker_base import WorkerWrapperBase
+try:
+    from vllm.worker.worker_base import WorkerWrapperBase
+except ModuleNotFoundError:
+    from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 
 from kernel.workers.agent import BaseAgent, KernelAgent

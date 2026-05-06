@@ -905,7 +905,24 @@ def main(config):
 def run_generation(config):
     if not ray.is_initialized():
         # this is for local ray cluster
-        ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
+        from omegaconf import OmegaConf
+
+        ray_init_kwargs = OmegaConf.to_container(config.get('ray_kwargs', {}).get('ray_init', {}), resolve=True) or {}
+        ray_init_kwargs = {key: value for key, value in ray_init_kwargs.items() if value is not None}
+
+        runtime_env = dict(ray_init_kwargs.pop('runtime_env', {}) or {})
+        env_vars = dict(runtime_env.get('env_vars', {}) or {})
+        env_vars.update({'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'})
+        runtime_env['env_vars'] = env_vars
+        ray_init_kwargs['runtime_env'] = runtime_env
+
+        if 'num_gpus' not in ray_init_kwargs and torch.cuda.is_available():
+            detected_gpus = torch.cuda.device_count()
+            if detected_gpus > 0:
+                ray_init_kwargs['num_gpus'] = detected_gpus
+
+        print(f"Initializing local Ray with kwargs: {ray_init_kwargs}")
+        ray.init(**ray_init_kwargs)
 
     return ray.get(main_task.remote(config))
 
@@ -952,6 +969,193 @@ def _coerce_extra_metric_value(value: Any) -> Optional[float]:
         return None
 
     return None
+
+
+def _run_deferred_profiling(output_batch, input_batch, config, tokenizer):
+    """
+    same_gpu_mode: after vLLM releases GPU memory (sleep), re-submit compiled kernels
+    to the KernelGYM server with profiling enabled. Updates token_level_scores and
+    reward_extra_info in output_batch in-place.
+
+    Args:
+        output_batch: DataProto from generate_sequences (has kernel codes, per-turn scores)
+        input_batch:  DataProto with ground_truth (reward_model) and entry_point (extra_info)
+        config:       Hydra config (config.reward_model used for reward_config)
+        tokenizer:    tokenizer for decoding response token IDs
+
+    Returns:
+        Updated output_batch with profiling results applied.
+    """
+    from kernel.rewards.kernel_reward import compute_kernel_reward_batch
+
+    reward_extra_info_raw = output_batch.non_tensor_batch.get("reward_extra_info", None)
+    if reward_extra_info_raw is None:
+        print("[SameGPUMode] No reward_extra_info in output_batch, skipping deferred profiling.")
+        return output_batch
+
+    if hasattr(reward_extra_info_raw, "tolist"):
+        reward_extra_info_list = reward_extra_info_raw.tolist()
+    else:
+        reward_extra_info_list = list(reward_extra_info_raw)
+
+    # Build UID → metadata maps from input_batch (one row per sample, before multi-turn repeat)
+    input_uids = input_batch.non_tensor_batch.get("uid", None)
+    if input_uids is None:
+        print("[SameGPUMode] No uid in input_batch, skipping deferred profiling.")
+        return output_batch
+
+    uid_to_reward_model = {}
+    uid_to_entry_point = {}
+    reward_model_arr = input_batch.non_tensor_batch.get("reward_model", None)
+    extra_info_arr = input_batch.non_tensor_batch.get("extra_info", None)
+
+    for i, uid in enumerate(input_uids):
+        uid_str = str(uid)
+        rm = reward_model_arr[i] if reward_model_arr is not None else None
+        if isinstance(rm, str):
+            try:
+                rm = json.loads(rm)
+            except Exception:
+                rm = {}
+        rm = rm if isinstance(rm, dict) else {}
+        uid_to_reward_model[uid_str] = rm
+
+        entry_point = "Model"
+        if extra_info_arr is not None:
+            try:
+                ei = extra_info_arr[i]
+                if isinstance(ei, dict):
+                    entry_point = ei.get("entry_point", "Model")
+            except Exception:
+                pass
+        # Fallback: try entry_point stored in reward_model dict
+        if entry_point == "Model":
+            entry_point = rm.get("entry_point", "Model")
+        uid_to_entry_point[uid_str] = entry_point
+
+    # Determine which rows to profile (last compiled turn per UID)
+    output_uids = output_batch.non_tensor_batch.get("uid", None)
+    if output_uids is None:
+        print("[SameGPUMode] No uid in output_batch, skipping deferred profiling.")
+        return output_batch
+
+    is_multi_turn = "turn_indices" in output_batch.batch
+    candidate_rows = []
+
+    if is_multi_turn:
+        turn_indices = output_batch.batch["turn_indices"].cpu().numpy()
+        uid_best = {}  # uid_str -> (turn_id, row_idx) of last compiled turn
+        for i in range(len(output_batch.batch)):
+            t_idx = int(turn_indices[i])
+            if t_idx == -1:
+                continue  # skip padding turns
+            uid_str = str(output_uids[i])
+            extra = reward_extra_info_list[i] if i < len(reward_extra_info_list) else {}
+            compiled = extra.get("compiled", False) if isinstance(extra, dict) else False
+            if compiled:
+                if uid_str not in uid_best or t_idx > uid_best[uid_str][0]:
+                    uid_best[uid_str] = (t_idx, i)
+        candidate_rows = [row_idx for _, (_, row_idx) in uid_best.items()]
+    else:
+        for i in range(len(output_batch.batch)):
+            extra = reward_extra_info_list[i] if i < len(reward_extra_info_list) else {}
+            compiled = extra.get("compiled", False) if isinstance(extra, dict) else False
+            if compiled:
+                candidate_rows.append(i)
+
+    if not candidate_rows:
+        print("[SameGPUMode] No compiled kernels found for deferred profiling.")
+        return output_batch
+
+    print(f"[SameGPUMode] Running deferred profiling for {len(candidate_rows)} kernels...")
+
+    solution_strs = []
+    ground_truths = []
+    entry_points = []
+    uuids_list = []
+
+    for row_idx in candidate_rows:
+        response_ids = output_batch.batch["responses"][row_idx]
+        response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
+        solution_strs.append(response_text)
+
+        uid_str = str(output_uids[row_idx])
+        rm = uid_to_reward_model.get(uid_str, {})
+        ground_truth = rm.get("ground_truth") or rm.get("reference_code") or ""
+        ground_truths.append(ground_truth)
+        entry_points.append(uid_to_entry_point.get(uid_str, "Model"))
+        uuids_list.append(uid_str)
+
+    # Submit to KernelGYM with profiling enabled.
+    # _deferred_profiling=True bypasses same_gpu_mode suppression in compute_kernel_reward_batch.
+    try:
+        profiling_results = compute_kernel_reward_batch(
+            solution_strs=solution_strs,
+            ground_truths=ground_truths,
+            entry_points=entry_points,
+            uuids=uuids_list,
+            reward_config=config.reward_model,
+            _deferred_profiling=True,
+            is_valid=True,
+        )
+    except Exception as e:
+        print(f"[SameGPUMode] Deferred profiling failed: {e}. Keeping original scores.")
+        return output_batch
+
+    # Update token_level_scores and reward_extra_info
+    token_level_scores = output_batch.batch["token_level_scores"]
+
+    for i, row_idx in enumerate(candidate_rows):
+        if i >= len(profiling_results):
+            break
+        result = profiling_results[i]
+        if not isinstance(result, dict):
+            continue
+
+        new_score = float(result.get("score", result.get("reward", 0.0)))
+
+        # Replace the reward at the last valid response token position
+        row_scores = token_level_scores[row_idx]
+        nonzero_positions = (row_scores != 0.0).nonzero(as_tuple=True)[0]
+        if len(nonzero_positions) > 0:
+            last_pos = int(nonzero_positions[-1].item())
+            token_level_scores[row_idx, last_pos] = new_score
+        else:
+            # No existing non-zero score; find last valid response token
+            response_mask = output_batch.batch.get("response_mask", None)
+            if response_mask is not None:
+                valid_len = int(response_mask[row_idx].sum().item())
+            else:
+                pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+                valid_len = int((output_batch.batch["responses"][row_idx] != pad_id).sum().item())
+            if valid_len > 0:
+                token_level_scores[row_idx, valid_len - 1] = new_score
+            else:
+                token_level_scores[row_idx, -1] = new_score
+
+        # Update reward_extra_info with profiling results
+        if row_idx < len(reward_extra_info_list) and isinstance(reward_extra_info_list[row_idx], dict):
+            reward_extra_info_list[row_idx].update({
+                "performance": result.get("speedup", 0.0),
+                "is_speedup_positive": (result.get("speedup") or 0.0) >= 1.0 + getattr(
+                    config.reward_model, "speedup_eps", 0.01
+                ),
+                "profiling_deferred": True,
+                "num_custom_kernel": result.get("num_custom_kernel", 0),
+                "num_total_kernels": result.get("num_total_kernels", 0),
+                "custom_kernel_cuda_time_in_profiling_us": result.get(
+                    "custom_kernel_cuda_time_in_profiling_us", 0
+                ),
+                "total_kernel_run_time_in_profiling_us": result.get(
+                    "total_kernel_run_time_in_profiling_us", 0
+                ),
+            })
+
+    output_batch.batch["token_level_scores"] = token_level_scores
+    output_batch.non_tensor_batch["reward_extra_info"] = np.array(reward_extra_info_list, dtype=object)
+
+    print(f"[SameGPUMode] Deferred profiling complete. Updated {len(candidate_rows)} samples.")
+    return output_batch
 
 
 @ray.remote(num_cpus=1)
@@ -1006,7 +1210,22 @@ def main_task(config):
         assert config.data.n_samples == 1, 'When temperature=0, n_samples must be 1.'
 
     rollout_mode = config.actor_rollout_ref.rollout.get('mode', 'sync')
+    total_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
+    single_gpu_async_vllm = (
+        rollout_mode == "async_vllm"
+        and config.actor_rollout_ref.rollout.get('backend', 'vllm') == 'vllm'
+        and total_gpus == 1
+        and config.actor_rollout_ref.rollout.get('tensor_model_parallel_size', 1) == 1
+    )
+    if single_gpu_async_vllm:
+        print("Using lightweight standalone backend for single-GPU async_vllm to avoid hybrid rollout worker init.")
     async_rollout_mode = rollout_mode in ("async_vllm", "async_agent", "standalone_vllm")
+
+    same_gpu_mode = getattr(config.reward_model, "same_gpu_mode", False)
+    if same_gpu_mode:
+        print("=" * 80)
+        print("SAME GPU MODE ENABLED: Profiling suppressed during generation; deferred until vLLM sleeps.")
+        print("=" * 80)
 
     # Check if multi-turn is enabled
     multi_turn_enabled = (
@@ -1129,10 +1348,13 @@ def main_task(config):
         wg = None
         async_rollout_manager = None
 
-        if rollout_mode == "standalone_vllm":
+        if rollout_mode == "standalone_vllm" or single_gpu_async_vllm:
             from kernel.workers.rollout.async_server import StandaloneVLLMEngineManager
 
-            total_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
+            if single_gpu_async_vllm:
+                print("Using async rollout mode: async_vllm")
+                print("Single-GPU async_vllm will skip hybrid rollout workers and use standalone engine actors.")
+
             async_rollout_manager = StandaloneVLLMEngineManager(
                 config=actor_rollout_config,
                 tokenizer=tokenizer,
@@ -1140,7 +1362,10 @@ def main_task(config):
                 val_reward_fn=reward_fn,
                 total_gpus=total_gpus,
             )
-            print("StandaloneVLLMEngineManager initialized")
+            if single_gpu_async_vllm:
+                print("Single-GPU async_vllm initialized with StandaloneVLLMEngineManager")
+            else:
+                print("StandaloneVLLMEngineManager initialized")
         else:
             # Determine worker class based on rollout mode
             from verl_patch.workers.code.fsdp_workers import AsyncActorRolloutRefWorker
@@ -1185,6 +1410,13 @@ def main_task(config):
                     worker_group=wg,
                 )
                 print("AgentLoopManager initialized")
+
+        # In same_gpu_mode, keep vLLM resident across batches: skip its internal
+        # wake_up/sleep so KV cache is not freed/reallocated between batches.
+        # Profiling co-runs with an idle (loaded) vLLM on the same GPU.
+        if same_gpu_mode and async_rollout_manager is not None and hasattr(async_rollout_manager, "set_keep_warm"):
+            async_rollout_manager.set_keep_warm(True)
+            print("[SameGPUMode] vLLM keep_warm enabled — KV cache retained across batches.")
 
         # Setup for detailed output saving
     output_dir = os.path.dirname(config.data.output_path)
@@ -2005,9 +2237,16 @@ def main_task(config):
         if not async_rollout_mode:
             test_output_gen_batch_padded = wg.generate_sequences(test_gen_batch_padded)
         else:
-            async_rollout_manager.wake_up()
+            # In same_gpu_mode we keep vLLM warm across batches: weights stay resident,
+            # KV cache is not freed/reallocated between batches. Profiling runs alongside
+            # an idle (but loaded) vLLM. Saves the wake_up reallocation cost each batch.
+            if same_gpu_mode:
+                async_rollout_manager.wake_up()  # idempotent; no-op if already awake
+            else:
+                async_rollout_manager.wake_up()
             test_output_gen_batch_padded = async_rollout_manager.generate_sequences(test_gen_batch_padded)
-            async_rollout_manager.sleep()
+            if not same_gpu_mode:
+                async_rollout_manager.sleep()
 
         print('Generation complete for batch')
 
@@ -2082,6 +2321,18 @@ def main_task(config):
                 uids = test_output_gen_batch.non_tensor_batch["uid"]
                 print(f"  - UIDs in output: {uids}")
                 print(f"  - Unique UIDs: {np.unique(uids)}")
+
+        # same_gpu_mode: non-multi-turn batches still need a deferred profiling pass
+        # here in main_grading. Multi-turn same-GPU rollouts now do deferred profiling
+        # inside the async rollout engine's per-round barrier, so skip re-profiling them
+        # at this layer.
+        if same_gpu_mode and async_rollout_mode and not multi_turn_enabled:
+            test_output_gen_batch = _run_deferred_profiling(
+                output_batch=test_output_gen_batch,
+                input_batch=test_batch,
+                config=config,
+                tokenizer=tokenizer,
+            )
 
         if multi_turn_enabled:
             # For multi-turn, use multiturn_messages to build complete conversations
@@ -2277,6 +2528,16 @@ def main_task(config):
         all_output_texts.extend(output_texts)
 
         progress_counter += 1
+
+    # same_gpu_mode kept vLLM warm across batches; release GPU memory now that all batches are done.
+    if same_gpu_mode and async_rollout_mode and async_rollout_manager is not None:
+        try:
+            if hasattr(async_rollout_manager, "set_keep_warm"):
+                async_rollout_manager.set_keep_warm(False)
+            async_rollout_manager.sleep()
+            print("[SameGPUMode] All batches complete; vLLM put to sleep.")
+        except Exception as e:
+            print(f"[SameGPUMode] Final vLLM sleep failed (non-fatal): {e}")
 
     all_dataproto = DataProto.concat(all_dataproto)
 

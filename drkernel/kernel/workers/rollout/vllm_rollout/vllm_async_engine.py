@@ -1,4 +1,5 @@
 import asyncio
+from concurrent.futures import Future
 import json
 import logging
 import os
@@ -36,21 +37,19 @@ from verl.workers.rollout.schemas import (
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.logger import RequestLogger
-from vllm.entrypoints.openai.protocol import (
-    ChatCompletionRequest,
-    ChatCompletionResponse,
-    ErrorResponse,
-)
-from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
-from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
 from vllm.inputs import TokensPrompt
 from vllm.outputs import RequestOutput
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.executor.abstract import Executor
-from vllm.worker.worker_base import WorkerWrapperBase
+try:
+    from vllm.worker.worker_base import WorkerWrapperBase
+except ModuleNotFoundError:
+    from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 
 from kernel.workers.agent import BaseAgent, KernelAgent
+from kernel.rewards.kernel_reward import compute_kernel_reward_batch
+from kernel.workers.reward_manager.kernel_async import build_kernel_reward_tensors
 from verl_patch.workers.code.agent_env import (
     BaseEnv,
     FinishReasonTypeEnum,
@@ -88,6 +87,37 @@ from collections import defaultdict
 import re
 
 
+class _RayObjectRefFuture(Future):
+    """Lazy wrapper so vLLM v1 can poll a Ray ObjectRef via Future.result()."""
+
+    def __init__(self, ref):
+        super().__init__()
+        self._ref = ref
+
+    def done(self):
+        if super().done():
+            return True
+        ready_refs, _ = ray.wait([self._ref], timeout=0)
+        if not ready_refs:
+            return False
+        try:
+            self.set_result(ray.get(self._ref))
+        except Exception as exc:
+            self.set_exception(exc)
+        return True
+
+    def result(self, timeout=None):
+        if not super().done():
+            self.set_result(ray.get(self._ref, timeout=timeout))
+        return super().result(timeout=0)
+
+
+def _completed_future(value):
+    future = Future()
+    future.set_result(value)
+    return future
+
+
 @ray.remote
 class SlowestRequestTracker:
     """Ray actor to track the slowest request across all workers."""
@@ -120,6 +150,168 @@ class SlowestRequestTracker:
     def get_slowest_time(self) -> float:
         """Get the current slowest request time."""
         return self.slowest_request_time
+
+
+def _summarize_round_request_ids(request_ids: list[str], max_items: int = 4) -> str:
+    if len(request_ids) <= max_items:
+        return ",".join(request_ids)
+
+    shown_request_ids = ",".join(request_ids[:max_items])
+    return f"{shown_request_ids},...(+{len(request_ids) - max_items})"
+
+
+def _log_same_gpu_round_event(engine, event: str, **fields: Any) -> None:
+    normalized_fields = dict(fields)
+
+    request_ids = normalized_fields.get("request_ids")
+    if isinstance(request_ids, (list, tuple, set)):
+        request_id_list = [str(request_id) for request_id in request_ids]
+        normalized_fields["request_ids"] = _summarize_round_request_ids(request_id_list)
+        normalized_fields.setdefault("request_count", len(request_id_list))
+
+    field_text = ", ".join(f"{key}={normalized_fields[key]}" for key in sorted(normalized_fields))
+    logging.info("[same_gpu_round] %s%s", event, f" {field_text}" if field_text else "")
+
+    logfire_logger = getattr(engine, "logfire_logger", None)
+    if logfire_logger:
+        try:
+            logfire_logger.info(f"same_gpu_round.{event}", **normalized_fields)
+        except Exception:
+            pass
+
+
+class SameGpuRoundCoordinator:
+    """Synchronize multi-turn requests so profiling runs only after a full round finishes."""
+
+    def __init__(self, engine, is_validate: bool, active_request_ids: list[str]):
+        self.engine = engine
+        self.is_validate = is_validate
+        self._active_request_ids = set(active_request_ids)
+        self._lock = asyncio.Lock()
+        self._round_states: dict[int, dict[str, Any]] = {}
+
+    def _maybe_schedule_locked(self, round_idx: int, state: dict[str, Any]) -> None:
+        if state["resolving"]:
+            return
+        if len(state["submitted"]) >= state["expected"]:
+            state["resolving"] = True
+            asyncio.create_task(self._resolve_round(round_idx))
+
+    async def submit_turn(
+        self,
+        request_id: str,
+        round_idx: int,
+        payload: dict[str, Any],
+        will_continue: bool,
+    ) -> dict[str, Any]:
+        async with self._lock:
+            state = self._round_states.get(round_idx)
+            if state is None:
+                state = {
+                    "expected": len(self._active_request_ids),
+                    "submitted": {},
+                    "futures": {},
+                    "resolving": False,
+                }
+                self._round_states[round_idx] = state
+
+            future = state["futures"].get(request_id)
+            if future is None:
+                future = asyncio.get_running_loop().create_future()
+                state["futures"][request_id] = future
+
+            state["submitted"][request_id] = {
+                "payload": payload,
+                "will_continue": will_continue,
+            }
+            self._maybe_schedule_locked(round_idx, state)
+
+            submitted_count = len(state["submitted"])
+            expected_count = state["expected"]
+            submitted_request_ids = list(state["submitted"].keys())
+            resolving = state["resolving"]
+
+        _log_same_gpu_round_event(
+            self.engine,
+            "submit",
+            round_idx=round_idx,
+            request_id=request_id,
+            submitted=submitted_count,
+            expected=expected_count,
+            resolving=resolving,
+            will_continue=will_continue,
+            request_ids=submitted_request_ids,
+        )
+
+        return await future
+
+    async def cancel_request(self, request_id: str) -> None:
+        async with self._lock:
+            self._active_request_ids.discard(request_id)
+            for round_idx, state in self._round_states.items():
+                if request_id in state["submitted"]:
+                    continue
+                state["expected"] = len(self._active_request_ids)
+                self._maybe_schedule_locked(round_idx, state)
+
+            active_request_ids = sorted(self._active_request_ids)
+
+        _log_same_gpu_round_event(
+            self.engine,
+            "cancel",
+            request_id=request_id,
+            active_remaining=len(active_request_ids),
+            request_ids=active_request_ids,
+        )
+
+    async def _resolve_round(self, round_idx: int) -> None:
+        async with self._lock:
+            state = self._round_states[round_idx]
+            expected_count = state["expected"]
+            submissions = {
+                request_id: {
+                    "payload": dict(submission["payload"]),
+                    "will_continue": submission["will_continue"],
+                }
+                for request_id, submission in state["submitted"].items()
+            }
+
+        request_ids = sorted(submissions.keys())
+        _log_same_gpu_round_event(
+            self.engine,
+            "resolve_start",
+            round_idx=round_idx,
+            submitted=len(request_ids),
+            expected=expected_count,
+            request_ids=request_ids,
+        )
+
+        resolved_payloads = await self.engine._resolve_same_gpu_round(
+            submissions,
+            self.is_validate,
+            round_idx=round_idx,
+        )
+        next_active_request_ids = {
+            request_id
+            for request_id, submission in submissions.items()
+            if submission["will_continue"]
+        }
+
+        _log_same_gpu_round_event(
+            self.engine,
+            "resolve_finish",
+            round_idx=round_idx,
+            next_active=len(next_active_request_ids),
+            request_ids=sorted(next_active_request_ids),
+        )
+
+        async with self._lock:
+            self._active_request_ids = next_active_request_ids
+            state = self._round_states[round_idx]
+            for request_id, future in state["futures"].items():
+                if not future.done():
+                    future.set_result(resolved_payloads[request_id])
+            del self._round_states[round_idx]
 
 
 def _create_logfire_logger(service_name: str = "vllm-async-engine"):
@@ -217,6 +409,7 @@ class ExternalRayDistributedExecutor(Executor):
         timeout: Optional[float] = None,
         args: Tuple = (),
         kwargs: Optional[Dict[str, Any]] = None,
+        non_block: bool = False,
     ) -> List[Any]:
         # TODO(wuxibin): support ray compiled graph
         if isinstance(method, str):
@@ -226,9 +419,11 @@ class ExternalRayDistributedExecutor(Executor):
 
         del method
 
-        outputs = ray.get(
-            [worker.execute_method.remote(sent_method, *args, **(kwargs or {})) for worker in self.workers]
-        )
+        outputs = [worker.execute_method.remote(sent_method, *args, **(kwargs or {})) for worker in self.workers]
+        if non_block:
+            return [_RayObjectRefFuture(output) for output in outputs]
+
+        outputs = ray.get(outputs, timeout=timeout)
         return outputs
 
     def check_health(self):
@@ -266,6 +461,7 @@ class ExternalZeroMQDistributedExecutor(Executor):
         timeout: Optional[float] = None,
         args: Tuple = (),
         kwargs: Optional[Dict[str, Any]] = None,
+        non_block: bool = False,
     ) -> List[Any]:
         if isinstance(method, str):
             sent_method = method
@@ -280,6 +476,10 @@ class ExternalZeroMQDistributedExecutor(Executor):
         outputs = []
         for socket in self.sockets:
             outputs.append(pickle.loads(socket.recv()))
+
+        if non_block:
+            return [_completed_future(output) for output in outputs]
+
         return outputs
 
     def check_health(self):
@@ -377,6 +577,7 @@ class ExternalRayDistributedExecutor(Executor):
         timeout: Optional[float] = None,
         args: Tuple = (),
         kwargs: Optional[Dict[str, Any]] = None,
+        non_block: bool = False,
     ) -> List[Any]:
         # TODO(wuxibin): support ray compiled graph
         if isinstance(method, str):
@@ -386,9 +587,11 @@ class ExternalRayDistributedExecutor(Executor):
 
         del method
 
-        outputs = ray.get(
-            [worker.execute_method.remote(sent_method, *args, **(kwargs or {})) for worker in self.workers]
-        )
+        outputs = [worker.execute_method.remote(sent_method, *args, **(kwargs or {})) for worker in self.workers]
+        if non_block:
+            return [_RayObjectRefFuture(output) for output in outputs]
+
+        outputs = ray.get(outputs, timeout=timeout)
         return outputs
 
     def check_health(self):
@@ -426,6 +629,7 @@ class ExternalZeroMQDistributedExecutor(Executor):
         timeout: Optional[float] = None,
         args: Tuple = (),
         kwargs: Optional[Dict[str, Any]] = None,
+        non_block: bool = False,
     ) -> List[Any]:
         if isinstance(method, str):
             sent_method = method
@@ -440,6 +644,8 @@ class ExternalZeroMQDistributedExecutor(Executor):
         outputs = []
         for socket in self.sockets:
             outputs.append(pickle.loads(socket.recv()))
+        if non_block:
+            return [_completed_future(output) for output in outputs]
         return outputs
 
     def check_health(self):
@@ -1115,6 +1321,136 @@ class MultiTurnAsyncvLLMEngine:
 
         return per_turn_prompts
 
+    def _same_gpu_mode_enabled(self) -> bool:
+        if self.env_type != "KernelEnv":
+            return False
+        return bool(OmegaConf.select(self.config, "reward_model.same_gpu_mode", default=False))
+
+    def _render_tool_response(self, env_state: dict) -> str:
+        try:
+            tool_response = json.dumps(env_state, ensure_ascii=False, indent=2)
+        except Exception:
+            tool_response = str(env_state)
+
+        if self.per_turn_prompts is not None:
+            current_prompt_config = self.per_turn_prompts.get("tool_response")
+            if current_prompt_config is not None:
+                current_prompt_template = current_prompt_config.get("template")
+                if current_prompt_template is not None:
+                    tool_response = current_prompt_template.format(feedback=tool_response)
+
+        return tool_response
+
+    async def _run_same_gpu_profiling_batch(
+        self,
+        profiling_inputs: list[dict[str, Any]],
+        is_validate: bool,
+    ) -> list[dict[str, Any]]:
+        reward_manager = self.val_reward_fn if is_validate else self.reward_fn
+        reward_config = getattr(reward_manager, "reward_config", None)
+        if reward_config is None:
+            return [item["env_state"] for item in profiling_inputs]
+
+        solution_strs = [item["model_response"] for item in profiling_inputs]
+        ground_truths = [item["ground_truth"] for item in profiling_inputs]
+        entry_points = [item["entry_point"] for item in profiling_inputs]
+        uuids = [item["uuid"] for item in profiling_inputs]
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: compute_kernel_reward_batch(
+                solution_strs,
+                ground_truths,
+                entry_points,
+                uuids=uuids,
+                reward_config=reward_config,
+                is_valid=getattr(reward_manager, "is_valid", False),
+                _force_profiling=True,
+            ),
+        )
+
+    async def _resolve_same_gpu_round(
+        self,
+        submissions: dict[str, dict[str, Any]],
+        is_validate: bool,
+        round_idx: int,
+    ) -> dict[str, dict[str, Any]]:
+        resolved_payloads = {
+            request_id: dict(submission["payload"])
+            for request_id, submission in submissions.items()
+        }
+
+        profiling_inputs = []
+        profiling_request_ids = []
+        for request_id, payload in resolved_payloads.items():
+            env_state = payload.get("env_state") or {}
+            payload["tool_response"] = self._render_tool_response(env_state) if env_state else None
+            if env_state.get("compiled", False) and payload.get("model_response"):
+                profiling_request_ids.append(request_id)
+                profiling_inputs.append(payload)
+
+        _log_same_gpu_round_event(
+            self,
+            "profiling_candidates",
+            round_idx=round_idx,
+            total_submissions=len(resolved_payloads),
+            compiled_candidates=len(profiling_request_ids),
+            request_ids=profiling_request_ids,
+        )
+
+        profiling_wall_time = 0.0
+        profiling_results = []
+        if profiling_inputs:
+            _log_same_gpu_round_event(
+                self,
+                "profiling_start",
+                round_idx=round_idx,
+                candidate_count=len(profiling_inputs),
+                request_ids=profiling_request_ids,
+            )
+            profiling_start_time = asyncio.get_event_loop().time()
+            profiling_results = await self._run_same_gpu_profiling_batch(profiling_inputs, is_validate)
+            profiling_wall_time = asyncio.get_event_loop().time() - profiling_start_time
+            _log_same_gpu_round_event(
+                self,
+                "profiling_finish",
+                round_idx=round_idx,
+                candidate_count=len(profiling_inputs),
+                wall_time_sec=f"{profiling_wall_time:.3f}",
+                request_ids=profiling_request_ids,
+            )
+        else:
+            _log_same_gpu_round_event(
+                self,
+                "profiling_skip",
+                round_idx=round_idx,
+                candidate_count=0,
+            )
+
+        reward_manager = self.val_reward_fn if is_validate else self.reward_fn
+        for request_id, profiled_result in zip(profiling_request_ids, profiling_results):
+            payload = resolved_payloads[request_id]
+            profiled_env_state = dict(payload.get("env_state") or {})
+            if isinstance(profiled_result, dict):
+                profiled_env_state.update(profiled_result)
+
+            reward_tensor, reward_extra_info = build_kernel_reward_tensors(
+                profiled_env_state,
+                reward_manager.reward_config,
+                max(1, len(payload.get("model_response_token_ids") or [])),
+            )
+            merged_turn_info = dict(payload.get("turn_info") or {})
+            merged_turn_info.update(reward_extra_info)
+
+            payload["env_state"] = profiled_env_state
+            payload["turn_info"] = merged_turn_info
+            payload["turn_reward"] = float(reward_tensor.sum().item())
+            payload["tool_response"] = self._render_tool_response(profiled_env_state)
+            payload["env_step_time"] = payload.get("env_step_time", 0.0) + profiling_wall_time
+
+        return resolved_payloads
+
     def log_multiturn_messages(
         self,
         step: int,
@@ -1745,30 +2081,8 @@ class MultiTurnAsyncvLLMEngine:
         #TODO: weiliu: change the env results and change returns of kernel clients
         # tool_response, env_done, truncate, turn_reward, tool_info = env_result
         env_state = env_result["env_state"]
-
-        try:
-            tool_response_json = json.dumps(env_state, ensure_ascii=False, indent=2)
-        except Exception:
-            tool_response_json = str(env_state)
-        tool_response = tool_response_json
-
-        make_up_tool_response = True    # makeup tool response secondly
-        
-        current_prompt_config = None
-        for prompt_name, prompt_config in self.per_turn_prompts.items():
-            if prompt_name == "tool_response":
-                current_prompt_config = prompt_config
-                break
-        if current_prompt_config is not None:
-            history_mode = current_prompt_config["history_mode"]
-            update_memory = current_prompt_config["update_memory"]
-            skip_env_prob = current_prompt_config["skip_env"]
-            current_prompt_template = current_prompt_config["template"]
-            
-            if current_prompt_template is not None:
-                tool_response = current_prompt_template.format(feedback=tool_response)
-
-                print(f"tool_response: {tool_response}")
+        tool_response = self._render_tool_response(env_state)
+        print(f"tool_response: {tool_response}")
 
         # Extract scalar reward from reward_tensor (sum of all token-level rewards)
         reward_tensor = env_result["reward_tensor"]
@@ -1815,6 +2129,8 @@ class MultiTurnAsyncvLLMEngine:
         entry_point: str = None,
         uuid: str = None,
         actual_max_turns: int = None,
+        request_id: str = None,
+        round_coordinator: Optional[SameGpuRoundCoordinator] = None,
         **kwargs,
     ) -> AgentLoopOutput:
         """Run the full agent loop for multi-turn conversation.
@@ -1862,7 +2178,7 @@ class MultiTurnAsyncvLLMEngine:
         all_turn_responses = []
         all_turn_lengths = []
 
-        request_id = uuid4().hex
+        request_id = request_id or uuid4().hex
         logging_message = []
         turn_infos = []  # Store turn_info for each turn
         request_start_time = asyncio.get_event_loop().time()
@@ -1904,7 +2220,39 @@ class MultiTurnAsyncvLLMEngine:
 
             # (TODO) Qian: only when there is something wrong we get None response (e.g. async timeout)
             if model_response is None:
+                if round_coordinator is not None:
+                    await round_coordinator.cancel_request(request_id)
                 return None
+
+            if round_coordinator is not None:
+                round_idx = req.get_num_turns() + 1
+                resolved_turn = await round_coordinator.submit_turn(
+                    request_id=request_id,
+                    round_idx=round_idx,
+                    payload={
+                        "model_response": model_response,
+                        "tool_response": tool_response,
+                        "model_time": model_time,
+                        "env_step_time": env_step_time,
+                        "turn_done": turn_done,
+                        "turn_truncate": turn_truncate,
+                        "turn_reward": turn_reward,
+                        "turn_info": dict(turn_info) if turn_info is not None else {},
+                        "model_response_token_ids": model_response_token_ids,
+                        "model_logprobs": model_logprobs,
+                        "prompt_token_ids": prompt_token_ids,
+                        "env_state": dict(turn_env_state) if turn_env_state is not None else {},
+                        "ground_truth": ground_truth,
+                        "entry_point": entry_point,
+                        "uuid": uuid,
+                    },
+                    will_continue=not turn_done,
+                )
+                tool_response = resolved_turn["tool_response"]
+                env_step_time = resolved_turn["env_step_time"]
+                turn_reward = resolved_turn["turn_reward"]
+                turn_info = resolved_turn["turn_info"]
+                turn_env_state = resolved_turn["env_state"]
 
             req.add_message(message=model_response, is_tool_call=False, response_token_ids=model_response_token_ids)
             logging_message.append(
@@ -2230,6 +2578,11 @@ class MultiTurnAsyncvLLMEngine:
         # Extract uid from non_tensor_batch
         uids = prompts.non_tensor_batch["uid"]
 
+        batch_request_ids = [uuid4().hex for _ in range(len(raw_prompts))]
+        round_coordinator = None
+        if self._same_gpu_mode_enabled():
+            round_coordinator = SameGpuRoundCoordinator(self, is_validate, batch_request_ids)
+
         tasks = []
         for i, (messages, tokens, ground_truth, entry_point, uuid) in enumerate(zip(raw_prompts, tokens_ids, ground_truths, entry_points, uuids)):
             # Extract prompt-dependent extra_info
@@ -2281,7 +2634,19 @@ class MultiTurnAsyncvLLMEngine:
             tasks.append(
                 asyncio.create_task(
                     self._async_agent_loop(
-                        messages, tokens, sampling_params, is_validate, global_step, extra_info, ground_truth, entry_point, uuid, actual_max_turns, **kwargs
+                        messages,
+                        tokens,
+                        sampling_params,
+                        is_validate,
+                        global_step,
+                        extra_info,
+                        ground_truth,
+                        entry_point,
+                        uuid,
+                        actual_max_turns,
+                        request_id=batch_request_ids[i],
+                        round_coordinator=round_coordinator,
+                        **kwargs,
                     )
                 )
             )

@@ -40,11 +40,15 @@ from tensordict import TensorDict
 from torch import nn
 from verl import DataProto
 from verl.third_party.vllm import vllm_version
+from verl.utils.ray_utils import ray_noset_visible_devices
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
 from vllm import LLM, SamplingParams
 from vllm.distributed import parallel_state as vllm_ps
-from vllm.worker.worker_base import WorkerWrapperBase
+try:
+    from vllm.worker.worker_base import WorkerWrapperBase
+except ModuleNotFoundError:
+    from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 from verl_patch.utils.random import save_random_states, set_random_states
 from verl_patch.workers.code.rollout.vllm_rollout.vllm_config_helper import (
@@ -466,10 +470,15 @@ class vLLMAsyncRollout:
     def init_worker(self, all_kwargs: List[Dict[str, Any]]):
         """Initialize worker engine."""
         all_kwargs[0]["rank"] = int(os.environ["RANK"])
-        all_kwargs[0]["local_rank"] = 0
+        all_kwargs[0]["local_rank"] = 0 if not ray_noset_visible_devices() else int(os.environ.get("RAY_LOCAL_RANK", 0))
 
         self.vllm_config = all_kwargs[0]["vllm_config"]
-        self.inference_engine = WorkerWrapperBase(vllm_config=self.vllm_config)
+        try:
+            self.inference_engine = WorkerWrapperBase(vllm_config=self.vllm_config)
+        except TypeError as exc:
+            if "unexpected keyword argument 'vllm_config'" not in str(exc):
+                raise
+            self.inference_engine = WorkerWrapperBase()
         self.inference_engine.init_worker(all_kwargs)
 
     def load_model(self, *args, **kwargs):

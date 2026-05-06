@@ -70,8 +70,11 @@ PASS_AT_K=${PASS_AT_K:-1}                          # Pass@k metric k value
 # Rollout Mode Configuration
 ROLLOUT_MODE=${ROLLOUT_MODE:-"sync"}                # "sync", "async_vllm", "async_agent", or "standalone_vllm"
 ROLLOUT_TENSOR_MODEL_PARALLEL_SIZE=${ROLLOUT_TENSOR_MODEL_PARALLEL_SIZE:-1}
+ROLLOUT_DTYPE=${ROLLOUT_DTYPE:-"bfloat16"}
 ROLLOUT_GPU_MEMORY_UTIL=${ROLLOUT_GPU_MEMORY_UTIL:-0.75}
 ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-False}
+VLLM_QUANTIZATION=${VLLM_QUANTIZATION:-""}
+VLLM_KV_CACHE_DTYPE=${VLLM_KV_CACHE_DTYPE:-""}
 
 BACKEND=${BACKEND:-"vllm"}
 OPENAI_MODEL=${OPENAI_MODEL:-""}
@@ -99,6 +102,7 @@ REWARD_MAX_RETRIES=${REWARD_MAX_RETRIES:-3}
 REWARD_TASK_TIMEOUT=${REWARD_TASK_TIMEOUT:-600}
 REWARD_TASK_TIMEOUT_CLIENT=${REWARD_TASK_TIMEOUT_CLIENT:-2400}
 REWARD_PRINT_STATUS=${REWARD_PRINT_STATUS:-True}
+SAME_GPU_MODE=${SAME_GPU_MODE:-False}
 NUM_PERF_TRIALS=${NUM_PERF_TRIALS:-100}
 NUM_CORRECT_TRIALS=${NUM_CORRECT_TRIALS:-5}
 SPEEDUP_REWARD_UPPER_BOUND=${SPEEDUP_REWARD_UPPER_BOUND:-3.0}
@@ -201,7 +205,10 @@ show_help() {
   echo "  --temperature TEMP            Sampling temperature (default: 0.8)"
   echo "  --top_p VALUE                 Top-p sampling (default: 0.95)"
   echo "  --rollout_mode MODE           Rollout mode: sync|async_vllm|async_agent|standalone_vllm (default: sync)"
+  echo "  --rollout_dtype DTYPE         Rollout dtype (default: bfloat16)"
   echo "  --rollout_enforce_eager BOOL  Force eager mode for vLLM (default: False)"
+  echo "  --vllm_quantization MODE      Optional vLLM quantization mode (for example: fp8)"
+  echo "  --vllm_kv_cache_dtype DTYPE   Optional vLLM KV cache dtype (for example: fp8)"
   echo ""
   echo "Evaluation Options:"
   echo "  --solve_threshold THRESH      Solve threshold 0.0-1.0 (default: 0.99)"
@@ -262,8 +269,11 @@ parse_arguments() {
       --pass_at_k) PASS_AT_K="$2"; shift 2 ;;
       --rollout_mode) ROLLOUT_MODE="$2"; shift 2 ;;
       --rollout_tp) ROLLOUT_TENSOR_MODEL_PARALLEL_SIZE="$2"; shift 2 ;;
+      --rollout_dtype) ROLLOUT_DTYPE="$2"; shift 2 ;;
       --rollout_gpu_memory_util) ROLLOUT_GPU_MEMORY_UTIL="$2"; shift 2 ;;
       --rollout_enforce_eager) ROLLOUT_ENFORCE_EAGER="$2"; shift 2 ;;
+      --vllm_quantization) VLLM_QUANTIZATION="$2"; shift 2 ;;
+      --vllm_kv_cache_dtype) VLLM_KV_CACHE_DTYPE="$2"; shift 2 ;;
       --reward_manager) REWARD_MANAGER="$2"; shift 2 ;;
       --reward_server_url) REWARD_SERVER_URL="$2"; shift 2 ;;
       --reward_func_name) REWARD_FUNC_NAME="$2"; shift 2 ;;
@@ -276,6 +286,7 @@ parse_arguments() {
       --reward_max_retries) REWARD_MAX_RETRIES="$2"; shift 2 ;;
       --reward_task_timeout) REWARD_TASK_TIMEOUT="$2"; shift 2 ;;
       --reward_print_status) REWARD_PRINT_STATUS="$2"; shift 2 ;;
+      --same_gpu_mode) SAME_GPU_MODE="$2"; shift 2 ;;
       --reward_weights) REWARD_WEIGHTS="$2"; shift 2 ;;
       --num_perf_trials) NUM_PERF_TRIALS="$2"; shift 2 ;;
       --num_correct_trials) NUM_CORRECT_TRIALS="$2"; shift 2 ;;
@@ -349,8 +360,15 @@ setup_grading_environment() {
   echo "  Temperature: $TEMPERATURE"
   echo "  Top-P: $TOP_P"
   echo "  Rollout Mode: $ROLLOUT_MODE"
+  echo "  Rollout DType: $ROLLOUT_DTYPE"
   echo "  Max Prompt Length: $MAX_PROMPT_LENGTH"
   echo "  Max Response Length: $MAX_RESPONSE_LENGTH"
+  if [[ -n "$VLLM_QUANTIZATION" ]]; then
+    echo "  vLLM Quantization: $VLLM_QUANTIZATION"
+  fi
+  if [[ -n "$VLLM_KV_CACHE_DTYPE" ]]; then
+    echo "  vLLM KV Cache DType: $VLLM_KV_CACHE_DTYPE"
+  fi
   echo ""
   echo "Evaluation Metrics:"
   echo "  Solve Threshold: $SOLVE_THRESHOLD"
@@ -377,6 +395,8 @@ run_grading() {
   local raw_response_arg=""
   local dataproto_arg=""
   local metrics_arg=""
+  local rollout_quantization_arg=""
+  local rollout_kv_cache_dtype_arg=""
 
   if [[ -n "$RAW_RESPONSE_PATH" ]]; then
     raw_response_arg="data.raw_response_path=$RAW_RESPONSE_PATH"
@@ -388,6 +408,14 @@ run_grading() {
 
   if [[ -n "$METRICS_OUTPUT_PATH" ]]; then
     metrics_arg="data.metrics_output_path=$METRICS_OUTPUT_PATH"
+  fi
+
+  if [[ -n "$VLLM_QUANTIZATION" ]]; then
+    rollout_quantization_arg="+actor_rollout_ref.rollout.engine_kwargs.vllm.quantization=$VLLM_QUANTIZATION"
+  fi
+
+  if [[ -n "$VLLM_KV_CACHE_DTYPE" ]]; then
+    rollout_kv_cache_dtype_arg="+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=$VLLM_KV_CACHE_DTYPE"
   fi
 
   PYTHONUNBUFFERED=1 python -m kernel.main_grading \
@@ -407,6 +435,7 @@ run_grading() {
       model.path=$MODEL_PATH \
       actor_rollout_ref.model.path=$MODEL_PATH \
       actor_rollout_ref.rollout.mode=$ROLLOUT_MODE \
+      actor_rollout_ref.rollout.dtype=$ROLLOUT_DTYPE \
       actor_rollout_ref.rollout.temperature=$TEMPERATURE \
       actor_rollout_ref.rollout.top_p=$TOP_P \
       actor_rollout_ref.rollout.top_k=$TOP_K \
@@ -416,6 +445,8 @@ run_grading() {
       actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TENSOR_MODEL_PARALLEL_SIZE \
       actor_rollout_ref.rollout.gpu_memory_utilization=$ROLLOUT_GPU_MEMORY_UTIL \
       actor_rollout_ref.rollout.enforce_eager=$ROLLOUT_ENFORCE_EAGER \
+      $rollout_quantization_arg \
+      $rollout_kv_cache_dtype_arg \
       actor_rollout_ref.rollout.max_num_batched_tokens=$MAX_NUM_BATCHED_TOKENS \
       actor_rollout_ref.rollout.multi_turn.enable=$MULTI_TURN \
       actor_rollout_ref.rollout.multi_turn.max_user_turns=$MAX_USER_TURNS \
@@ -448,6 +479,7 @@ run_grading() {
       reward_model.task_timeout=$REWARD_TASK_TIMEOUT \
       reward_model.task_timeout_in_client=$REWARD_TASK_TIMEOUT_CLIENT \
       reward_model.print_status=$REWARD_PRINT_STATUS \
+      reward_model.same_gpu_mode=$SAME_GPU_MODE \
       reward_model.num_perf_trials=$NUM_PERF_TRIALS \
       reward_model.num_correct_trials=$NUM_CORRECT_TRIALS \
       reward_model.speedup_reward_upper_bound=$SPEEDUP_REWARD_UPPER_BOUND \

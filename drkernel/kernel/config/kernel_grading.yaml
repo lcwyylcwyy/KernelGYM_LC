@@ -314,6 +314,10 @@ reward_model:
   num_perf_trials: 100
   num_correct_trials: 5
   enable_profiling: true
+  # same_gpu_mode: when inference (vLLM) and the KernelGYM eval server share the same GPU,
+  # profiling during generation corrupts timing results. In this mode, profiling requests are
+  # suppressed during generation and deferred until vLLM has released GPU memory.
+  same_gpu_mode: false
   verbose_errors: true
   detect_decoy_kernel: true
 

@@ -155,9 +155,18 @@ class AsyncLLMEngineManager:
         # All server instances are ready, init AsyncLLM engine.
         ray.get([server.init_engine.remote() for server in self.async_llm_servers])
 
+        # keep_warm: when True, generate_sequences() skips internal wake_up/sleep so that
+        # vLLM keeps its KV cache memory between batches (used by same_gpu_mode to avoid
+        # repeatedly reallocating KV cache while another GPU consumer runs in between).
+        self._keep_warm = False
+
         assert self.config.rollout.free_cache_engine, "Only free cache engine is supported for now."
         if self.config.rollout.free_cache_engine:
             self.sleep()
+
+    def set_keep_warm(self, keep_warm: bool):
+        """Toggle keep-warm mode (skips wake_up/sleep inside generate_sequences)."""
+        self._keep_warm = bool(keep_warm)
 
     def wake_up(self):
         """Wake up all vllm instances."""
@@ -171,7 +180,7 @@ class AsyncLLMEngineManager:
         """Generate multiple sequences in parallel via chat scheduler."""
 
         assert self.config.rollout.free_cache_engine, "Only free cache engine is supported for now."
-        if self.config.rollout.free_cache_engine:
+        if self.config.rollout.free_cache_engine and not self._keep_warm:
             self.wake_up()
 
         chunkes = prompts.chunk(len(self.async_llm_servers))
@@ -187,7 +196,7 @@ class AsyncLLMEngineManager:
             return None
 
         output = DataProto.concat(outputs)
-        if self.config.rollout.free_cache_engine:
+        if self.config.rollout.free_cache_engine and not self._keep_warm:
             self.sleep()
         return output
 
@@ -276,9 +285,18 @@ class StandaloneVLLMEngineManager:
 
         ray.get([server.init_engine.remote() for server in self.async_llm_servers])
 
+        # keep_warm: when True, generate_sequences() skips internal wake_up/sleep so that
+        # vLLM keeps its KV cache memory between batches (used by same_gpu_mode to avoid
+        # repeatedly reallocating KV cache while another GPU consumer runs in between).
+        self._keep_warm = False
+
         assert self.config.rollout.free_cache_engine, "Only free cache engine is supported for now."
         if self.config.rollout.free_cache_engine:
             self.sleep()
+
+    def set_keep_warm(self, keep_warm: bool):
+        """Toggle keep-warm mode (skips wake_up/sleep inside generate_sequences)."""
+        self._keep_warm = bool(keep_warm)
 
     def wake_up(self):
         """Wake up all vllm instances."""
@@ -291,7 +309,7 @@ class StandaloneVLLMEngineManager:
     def generate_sequences(self, prompts: DataProto, **sampling_params) -> DataProto:
         """Generate multiple sequences in parallel via chat scheduler."""
         assert self.config.rollout.free_cache_engine, "Only free cache engine is supported for now."
-        if self.config.rollout.free_cache_engine:
+        if self.config.rollout.free_cache_engine and not self._keep_warm:
             self.wake_up()
 
         chunkes = prompts.chunk(len(self.async_llm_servers))
@@ -306,6 +324,6 @@ class StandaloneVLLMEngineManager:
             return None
 
         output = DataProto.concat(outputs)
-        if self.config.rollout.free_cache_engine:
+        if self.config.rollout.free_cache_engine and not self._keep_warm:
             self.sleep()
         return output

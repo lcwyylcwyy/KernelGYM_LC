@@ -26,6 +26,69 @@ from verl.utils.reward_score import default_compute_score
 from verl.workers.reward_manager import register
 
 
+def build_kernel_reward_tensors(result: dict, reward_config, valid_response_length: int):
+    """Convert a raw kernel env result into reward tensor and extra info."""
+    reward_tensor = torch.zeros(valid_response_length, dtype=torch.float32)
+    reward_extra_info = {}
+
+    correctness_tensor = torch.zeros(1, dtype=torch.float32)
+    performance_tensor = torch.zeros(1, dtype=torch.float32)
+    compilation_tensor = torch.zeros(1, dtype=torch.float32)
+
+    score = result.get("score", result.get("reward", 0.0))
+    num_custom_kernel = result.get("num_custom_kernel", 0)
+    num_total_kernels = result.get("num_total_kernels", 0)
+    custom_kernel_cuda_time_in_profiling_us = result.get("custom_kernel_cuda_time_in_profiling_us", 0)
+    total_kernel_run_time_in_profiling_us = result.get("total_kernel_run_time_in_profiling_us", 0)
+    correctness = result.get("correctness", False)
+    success = result.get("success", False)
+    compiled = result.get("compiled", False)
+    speedup = result.get("speedup", 0.0)
+    if speedup is None:
+        speedup = 0.0
+    status = result.get("status", "unknown")
+    err_msg = result.get("error")
+    is_speedup_positive = speedup >= 1.0 + reward_config.speedup_eps
+    is_decoy_kernel = result.get("decoy_kernel", False)
+
+    reward_tensor[valid_response_length - 1] = score
+    correctness_tensor[0] = float(correctness)
+    performance_tensor[0] = speedup
+    compilation_tensor[0] = float(compiled)
+
+    reward_extra_info["correctness"] = correctness
+    reward_extra_info["performance"] = speedup
+    reward_extra_info["speedup"] = speedup
+    reward_extra_info["is_speedup_positive"] = is_speedup_positive
+    reward_extra_info["is_decoy_kernel"] = is_decoy_kernel
+    reward_extra_info["decoy_kernel"] = is_decoy_kernel
+    reward_extra_info["compilation"] = compiled
+    reward_extra_info["compiled"] = compiled
+    reward_extra_info["success"] = success
+    reward_extra_info["status"] = status
+    reward_extra_info["error"] = err_msg
+    reward_extra_info["num_custom_kernel"] = num_custom_kernel
+    reward_extra_info["num_total_kernels"] = num_total_kernels
+
+    num_coverage = 0.0
+    if num_total_kernels > 0:
+        num_coverage = num_custom_kernel / num_total_kernels
+    reward_extra_info["num_coverage"] = float(f"{num_coverage:.2f}")
+    reward_extra_info["custom_kernel_cuda_time_in_profiling_us"] = custom_kernel_cuda_time_in_profiling_us
+    reward_extra_info["total_kernel_run_time_in_profiling_us"] = total_kernel_run_time_in_profiling_us
+
+    time_coverage = 0.0
+    if total_kernel_run_time_in_profiling_us > 0:
+        time_coverage = custom_kernel_cuda_time_in_profiling_us / total_kernel_run_time_in_profiling_us
+    reward_extra_info["time_coverage"] = float(f"{time_coverage:.2f}")
+
+    reward_extra_info["correctness_tensor"] = correctness_tensor
+    reward_extra_info["performance_tensor"] = performance_tensor
+    reward_extra_info["compilation_tensor"] = compilation_tensor
+
+    return reward_tensor, reward_extra_info
+
+
 # @register("kernel")
 class AsyncKernelRewardManager:
     """Kernel 奖励管理器，集成 KernelServer 进行内核性能评估"""
@@ -256,54 +319,22 @@ class AsyncKernelRewardManager:
 
         results = results[0]
 
-        score = results.get("score", results.get("reward", 0.0))
-        num_custom_kernel = results.get("num_custom_kernel", 0)
-        num_total_kernels = results.get("num_total_kernels", 0)
-        custom_kernel_cuda_time_in_profiling_us = results.get("custom_kernel_cuda_time_in_profiling_us", 0)
-        total_kernel_run_time_in_profiling_us = results.get("total_kernel_run_time_in_profiling_us", 0)
-        correctness = results.get("correctness", False)
-        success = results.get("success", False)
-        compiled = results.get("compiled", False)
-        speedup = results.get("speedup", 0.0)
-        if speedup is None:
-            speedup = 0.0
-        status = results.get("status", "unknown")
-        err_msg = results.get("error")
-        is_speedup_positive = (speedup >= 1.0 + self.reward_config.speedup_eps)
-        is_decoy_kernel = results.get("decoy_kernel", False)
+        reward_tensor, reward_extra_info = build_kernel_reward_tensors(
+            results,
+            self.reward_config,
+            valid_response_length,
+        )
 
-        target_index = valid_response_length - 1
-        reward_tensor[target_index] = score
-        correctness_tensor[0] = float(correctness)
-        performance_tensor[0] = speedup
-        compilation_tensor[0] = float(compiled)
-
-        reward_extra_info["correctness"] = correctness
-        reward_extra_info["performance"] = speedup
-        reward_extra_info["is_speedup_positive"] = is_speedup_positive
-        reward_extra_info["is_decoy_kernel"] = is_decoy_kernel
-        reward_extra_info["compilation"] = compiled
-        reward_extra_info["success"] = success
-        reward_extra_info["status"] = status
-        reward_extra_info["error"] = err_msg
-        
-        print(f"[DEBUG] num_custom_kernel in reward manager: {num_custom_kernel}")
-        print(f"[DEBUG] num_total_kernels in reward manager: {num_total_kernels}")
-        print(f"[DEBUG] custom_kernel_cuda_time_in_profiling_us in reward manager: {custom_kernel_cuda_time_in_profiling_us}")
-        print(f"[DEBUG] total_kernel_run_time_in_profiling_us in reward manager: {total_kernel_run_time_in_profiling_us}")
-        # new features
-        reward_extra_info["num_custom_kernel"] = num_custom_kernel
-        reward_extra_info["num_total_kernels"] = num_total_kernels
-        num_coverage = 0
-        if num_total_kernels > 0:
-            num_coverage = num_custom_kernel / num_total_kernels
-        reward_extra_info["num_coverage"] = float(f"{num_coverage:.2f}")
-        reward_extra_info["custom_kernel_cuda_time_in_profiling_us"] = custom_kernel_cuda_time_in_profiling_us
-        reward_extra_info["total_kernel_run_time_in_profiling_us"] = total_kernel_run_time_in_profiling_us
-        time_coverage = 0
-        if total_kernel_run_time_in_profiling_us > 0:
-            time_coverage = custom_kernel_cuda_time_in_profiling_us / total_kernel_run_time_in_profiling_us
-        reward_extra_info["time_coverage"] = float(f"{time_coverage:.2f}")
+        print(f"[DEBUG] num_custom_kernel in reward manager: {results.get('num_custom_kernel', 0)}")
+        print(f"[DEBUG] num_total_kernels in reward manager: {results.get('num_total_kernels', 0)}")
+        print(
+            f"[DEBUG] custom_kernel_cuda_time_in_profiling_us in reward manager: "
+            f"{results.get('custom_kernel_cuda_time_in_profiling_us', 0)}"
+        )
+        print(
+            f"[DEBUG] total_kernel_run_time_in_profiling_us in reward manager: "
+            f"{results.get('total_kernel_run_time_in_profiling_us', 0)}"
+        )
 
         # reward_extra_info["correctness"].append(correctness)
         # reward_extra_info["performance"].append(speedup)
@@ -315,14 +346,19 @@ class AsyncKernelRewardManager:
         # reward_extra_info.setdefault("error", []).append(err_msg or "")
 
         if self.print_status:
-            self.logger.info(f"[KernelEvalStatus] idx={0} status={status} compiled={compiled} correct={correctness} speedup={speedup} uuid={uuid} entry={entry_point} error={err_msg}")
+            self.logger.info(
+                "[KernelEvalStatus] idx=%s status=%s compiled=%s correct=%s speedup=%s uuid=%s entry=%s error=%s",
+                0,
+                reward_extra_info.get("status", "unknown"),
+                reward_extra_info.get("compiled", False),
+                reward_extra_info.get("correctness", False),
+                reward_extra_info.get("speedup", speedup),
+                uuid,
+                entry_point,
+                reward_extra_info.get("error"),
+            )
 
         if return_dict:
-            reward_extra_info["correctness_tensor"] = correctness_tensor
-            reward_extra_info["performance_tensor"] = performance_tensor
-            reward_extra_info["compilation_tensor"] = compilation_tensor
-            
-
             return_dict = {
                 "reward_tensor": reward_tensor,
                 "reward_extra_info": reward_extra_info,

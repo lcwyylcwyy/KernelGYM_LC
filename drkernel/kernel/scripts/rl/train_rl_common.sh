@@ -248,6 +248,29 @@ normalize_rollout_settings() {
   fi
 }
 
+prepare_vllm_ray_env() {
+  if [[ "$ROLLOUT_MODE" != *"vllm"* ]] || [ "$ROLLOUT_TENSOR_MODEL_PARALLEL_SIZE" -le 1 ]; then
+    return 0
+  fi
+
+  if [ -z "${RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES:-}" ]; then
+    export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
+    echo "Enabling RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES for vLLM tensor parallel rollout"
+  fi
+
+  if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    local visible_count
+    IFS=',' read -r -a __drkernel_visible_devices <<< "$CUDA_VISIBLE_DEVICES"
+    visible_count=${#__drkernel_visible_devices[@]}
+    unset __drkernel_visible_devices
+    if [ "$visible_count" -lt "$ROLLOUT_TENSOR_MODEL_PARALLEL_SIZE" ]; then
+      echo "Error: CUDA_VISIBLE_DEVICES exposes $visible_count GPU(s), but rollout TP requires $ROLLOUT_TENSOR_MODEL_PARALLEL_SIZE."
+      echo "Hint: unset CUDA_VISIBLE_DEVICES or expose at least $ROLLOUT_TENSOR_MODEL_PARALLEL_SIZE GPUs before launching training."
+      return 1
+    fi
+  fi
+}
+
 precheck_reward_server() {
   if [[ "${PRECHECK_REWARD_SERVER,,}" != "true" ]]; then
     return 0
@@ -687,6 +710,25 @@ setup_training_environment() {
   export MODEL_PATH_RESOLVED
   export CHECKPOINT_DIR
   export N_GPUS_PER_NODE
+
+  TOTAL_TRAIN_GPUS=$((NNODES * N_GPUS_PER_NODE))
+  if [ "$TOTAL_TRAIN_GPUS" -le 0 ]; then
+    echo "Error: total training GPUs must be > 0 (NNODES=$NNODES, N_GPUS_PER_NODE=$N_GPUS_PER_NODE)"
+    exit 1
+  fi
+
+  if [ "$SP_SIZE" -gt "$TOTAL_TRAIN_GPUS" ]; then
+    echo "Error: SP_SIZE ($SP_SIZE) cannot exceed total training GPUs ($TOTAL_TRAIN_GPUS)."
+    echo "Hint: Ulysses sequence parallel size must be <= world size."
+    exit 1
+  fi
+
+  if [ "$SP_SIZE" -gt 1 ] && [ $((TOTAL_TRAIN_GPUS % SP_SIZE)) -ne 0 ]; then
+    echo "Error: SP_SIZE ($SP_SIZE) must divide total training GPUs ($TOTAL_TRAIN_GPUS) exactly."
+    echo "Hint: choose an SP_SIZE that makes world_size / SP_SIZE an integer."
+    exit 1
+  fi
+
   echo "FULL RUN_NAME: $RUN_NAME"
   echo "Training with the following parameters:"
   echo "Train Batch Size: $TRAIN_BATCH_SIZE"
@@ -752,6 +794,7 @@ setup_training_environment() {
 }
 
 run_training() {
+  prepare_vllm_ray_env || return 1
   precheck_reward_server || return 1
   sleep 3
 
