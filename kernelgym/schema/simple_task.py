@@ -25,6 +25,8 @@ class KernelSimpleTask:
     cases_code: Optional[str] = None
     cases: Optional[List[Any]] = None
     resources: Optional[Dict[str, Any]] = None
+    reference_code: Optional[str] = None
+    reference_entry_point: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

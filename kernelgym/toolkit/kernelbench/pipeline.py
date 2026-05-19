@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import io
 import re
+import tempfile
 from contextlib import redirect_stderr, redirect_stdout
 from typing import Any, Dict, Optional, Union
 
@@ -111,6 +112,61 @@ def _extract_triton_sources_from_inductor_cache(
             if src not in seen:
                 seen.add(src)
                 collected.append(src)
+
+    return collected
+
+
+def _get_full_triton_files_from_cache(
+    cache_dir: str,
+    before_snapshot: Optional[Dict[str, float]] = None,
+    max_files: int = 20,
+) -> list[str]:
+    """Return the full content of inductor-generated Python files that contain Triton kernels.
+
+    Unlike ``_extract_triton_sources_from_inductor_cache``, this function returns the
+    *entire* file content rather than just the inner kernel source extracted from the
+    ``async_compile.triton(...)`` triple-quoted string.  Each returned string is a
+    complete standalone Python module that can be executed directly – it includes all
+    imports, ``@triton.jit`` kernel definitions, ``triton_heuristics`` wrappers, the
+    ``async_compile`` setup, and the ``call(args)`` invocation function.
+    """
+    after_snapshot = _snapshot_inductor_python_files(cache_dir)
+    if not after_snapshot:
+        return []
+
+    if before_snapshot:
+        changed = [
+            (path, mtime)
+            for path, mtime in after_snapshot.items()
+            if before_snapshot.get(path) is None or mtime > before_snapshot[path]
+        ]
+        candidates = changed if changed else list(after_snapshot.items())
+    else:
+        candidates = list(after_snapshot.items())
+
+    candidates.sort(key=lambda item: item[1], reverse=True)
+
+    collected: list[str] = []
+    seen_hashes: set[int] = set()
+    for path, _mtime in candidates[:max_files]:
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                content = fh.read()
+        except OSError:
+            continue
+        # Only include the AOT wrapper files (which contain the full call() invocation
+        # and are directly runnable).  Skip raw kernel-only cache files that contain
+        # only the @triton.jit definition without a call() entry point – those are the
+        # source of the duplicate content.
+        is_wrapper = "# AOT ID:" in content or (
+            "async_compile.wait(" in content and "def call(" in content
+        )
+        if not is_wrapper:
+            continue
+        h = hash(content)
+        if h not in seen_hashes:
+            seen_hashes.add(h)
+            collected.append(content)
 
     return collected
 
@@ -748,8 +804,13 @@ def eval_reference_only(
                     if not hasattr(torch, "compile"):
                         raise RuntimeError("torch.compile is not available")
                     if return_reference_triton:
-                        inductor_cache_dir = _resolve_inductor_cache_dir()
-                        before_cache_snapshot = _snapshot_inductor_python_files(inductor_cache_dir)
+                        # Use a fresh temp dir so we can reliably identify the
+                        # files written by *this* compile call and read them
+                        # back as complete standalone modules.
+                        inductor_cache_dir = tempfile.mkdtemp(prefix="kgym_inductor_")
+                        prev_inductor_cache = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+                        os.environ["TORCHINDUCTOR_CACHE_DIR"] = inductor_cache_dir
+
                         prev_torch_logs = os.environ.get("TORCH_LOGS")
                         prev_torch_compile_debug = os.environ.get("TORCH_COMPILE_DEBUG")
                         if prev_torch_logs:
@@ -772,7 +833,7 @@ def eval_reference_only(
                         try:
                             with redirect_stdout(capture_buffer), redirect_stderr(capture_buffer):
                                 model = torch.compile(model)
-                                # Trigger graph compile once so codegen logs are emitted.
+                                # Trigger graph compile once so codegen files are written.
                                 warmup_inputs = get_inputs()
                                 warmup_inputs = [
                                     x.cuda(device=device) if isinstance(x, torch.Tensor) else x
@@ -789,28 +850,42 @@ def eval_reference_only(
                                 os.environ.pop("TORCH_COMPILE_DEBUG", None)
                             else:
                                 os.environ["TORCH_COMPILE_DEBUG"] = prev_torch_compile_debug
+                            if prev_inductor_cache is None:
+                                os.environ.pop("TORCHINDUCTOR_CACHE_DIR", None)
+                            else:
+                                os.environ["TORCHINDUCTOR_CACHE_DIR"] = prev_inductor_cache
 
-                        captured_logs = capture_buffer.getvalue()
-                        triton_sources = _extract_triton_sources_from_output(captured_logs)
-                        extraction_source = "torch_logs"
-                        if not triton_sources:
-                            triton_sources = _extract_triton_sources_from_inductor_cache(
-                                inductor_cache_dir,
-                                before_cache_snapshot,
-                            )
+                        # Primary: collect full inductor-generated .py files.
+                        # Each file is a complete standalone module with imports,
+                        # @triton.jit kernel defs, heuristics wrappers, and call().
+                        triton_files = _get_full_triton_files_from_cache(inductor_cache_dir)
+                        extraction_source = "none"
+                        joined = ""
+                        if triton_files:
+                            extraction_source = "inductor_cache_full"
+                            sep = "\n\n# " + "=" * 60 + "\n# next kernel file\n# " + "=" * 60 + "\n\n"
+                            joined = sep.join(triton_files)
+                        else:
+                            # Fallback: parse captured log for inner kernel sources
+                            # (less complete – missing imports and call() code).
+                            captured_logs = capture_buffer.getvalue()
+                            triton_sources = _extract_triton_sources_from_output(captured_logs)
                             if triton_sources:
-                                extraction_source = "inductor_cache"
+                                extraction_source = "torch_logs_kernel_source"
+                                joined = "\n\n# ---- triton-kernel ----\n\n".join(triton_sources)
+
                         metadata["reference_triton_capture_enabled"] = True
                         metadata["reference_triton_extraction_source"] = extraction_source
-                        metadata["reference_triton_count"] = len(triton_sources)
-                        if triton_sources:
-                            joined = "\n\n# ---- triton-kernel ----\n\n".join(triton_sources)
+                        metadata["reference_triton_count"] = len(triton_files)
+                        metadata["reference_triton_cache_dir"] = inductor_cache_dir
+                        if joined:
                             metadata["reference_triton_code"] = _truncate_text(
                                 joined,
                                 reference_triton_max_chars,
                             )
                         else:
                             metadata["reference_triton_code"] = ""
+                            captured_logs = capture_buffer.getvalue()
                             if captured_logs:
                                 metadata["reference_triton_capture_log_excerpt"] = _truncate_text(
                                     captured_logs,

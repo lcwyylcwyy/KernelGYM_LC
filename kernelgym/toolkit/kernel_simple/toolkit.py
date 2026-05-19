@@ -302,7 +302,47 @@ class KernelSimpleToolkit(Toolkit):
             else:
                 metadata["performance_skipped"] = True
 
-            return KernelEvaluationResult(
+            reference_runtime = -1.0
+            speedup = 0.0
+            if run_performance and task_obj.reference_code and kernel_runtime > 0:
+                try:
+                    ref_context: Dict[str, Any] = {}
+                    exec(compile(task_obj.reference_code, "<reference>", "exec"), ref_context)  # nosec
+                    ref_entry = task_obj.reference_entry_point or "Model"
+                    ref_cls = ref_context.get(ref_entry)
+                    if ref_cls is not None:
+                        ref_init_fn = ref_context.get("get_init_inputs")
+                        ref_init_inputs = ref_init_fn() if callable(ref_init_fn) else []
+                        ref_model = ref_cls(*ref_init_inputs) if ref_init_inputs else ref_cls()
+                        ref_model = ref_model.to(device).eval()
+                        perf_inputs = _move_to_device(cases[0].get("inputs"), device)
+                        if isinstance(perf_inputs, dict):
+                            ref_fn = lambda: ref_model(**perf_inputs)
+                            ref_args: Tuple[Any, ...] = ()
+                        elif isinstance(perf_inputs, (list, tuple)):
+                            ref_fn = ref_model
+                            ref_args = tuple(perf_inputs)
+                        else:
+                            ref_fn = ref_model
+                            ref_args = (perf_inputs,)
+                        ref_times, _ = time_execution_with_cuda_event(
+                            ref_fn,
+                            *ref_args,
+                            num_warmup=task_obj.num_warmup,
+                            num_trials=task_obj.num_perf_trials,
+                            verbose=False,
+                            device=device,
+                            enable_profiling=False,
+                        )
+                        ref_stats = get_timing_stats(ref_times, device=device)
+                        reference_runtime = ref_stats["mean"]
+                        metadata["reference_runtime_stats"] = ref_stats
+                        if correctness and reference_runtime > 0:
+                            speedup = reference_runtime / kernel_runtime
+                except Exception as e:
+                    metadata["reference_timing_error"] = str(e)
+
+            result_dict = KernelEvaluationResult(
                 task_id=task_obj.task_id,
                 base_task_id=task_obj.task_id,
                 compiled=True,
@@ -312,6 +352,9 @@ class KernelSimpleToolkit(Toolkit):
                 metadata=metadata,
                 status="completed",
             ).to_dict()
+            result_dict["reference_runtime"] = reference_runtime
+            result_dict["speedup"] = speedup
+            return result_dict
 
         except Exception as e:
             error_code = ErrorCode.RUNTIME_ERROR
