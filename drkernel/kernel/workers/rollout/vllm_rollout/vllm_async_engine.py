@@ -1324,6 +1324,12 @@ class MultiTurnAsyncvLLMEngine:
     def _same_gpu_mode_enabled(self) -> bool:
         if self.env_type != "KernelEnv":
             return False
+        # Async rollout engines receive actor_rollout_ref config, so reward_model settings
+        # must be read from the injected reward manager instead of self.config.
+        reward_manager = self.val_reward_fn if self.val_reward_fn is not None else self.reward_fn
+        reward_config = getattr(reward_manager, "reward_config", None)
+        if reward_config is not None:
+            return bool(getattr(reward_config, "same_gpu_mode", False))
         return bool(OmegaConf.select(self.config, "reward_model.same_gpu_mode", default=False))
 
     def _render_tool_response(self, env_state: dict) -> str:

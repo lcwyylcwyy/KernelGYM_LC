@@ -8,6 +8,7 @@ from collections import deque
 from collections.abc import AsyncGenerator
 from contextlib import contextmanager
 from copy import deepcopy
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from uuid import uuid4
 
@@ -37,13 +38,24 @@ from verl.workers.rollout.schemas import (
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.logger import RequestLogger
-from vllm.entrypoints.openai.protocol import (
-    ChatCompletionRequest,
-    ChatCompletionResponse,
-    ErrorResponse,
-)
-from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
-from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
+try:
+    from vllm.entrypoints.openai.protocol import (
+        ChatCompletionRequest,
+        ChatCompletionResponse,
+        ErrorResponse,
+    )
+    from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
+    from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
+except ModuleNotFoundError:
+    # vLLM >= 0.16 reorganised the entrypoints package
+    from vllm.entrypoints.openai.chat_completion.protocol import (
+        ChatCompletionRequest,
+        ChatCompletionResponse,
+    )
+    from vllm.entrypoints.openai.engine.protocol import ErrorResponse
+    from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+    from vllm.entrypoints.openai.models.protocol import BaseModelPath
+    from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.inputs import TokensPrompt
 from vllm.outputs import RequestOutput
 from vllm.v1.engine.async_llm import AsyncLLM
@@ -382,6 +394,12 @@ def _resolve_openai_settings(config: DictConfig) -> dict[str, Any]:
     if reasoning_effort and reasoning_effort.lower() in ("none", "false", ""):
         reasoning_effort = None
 
+    use_responses_api = _coerce_bool(
+        openai_cfg.get("use_responses_api")
+        or os.getenv("OPENAI_USE_RESPONSES_API"),
+        default=False,
+    )
+
     extra_headers = openai_cfg.get("extra_headers") or {}
     from collections.abc import Mapping
     if isinstance(extra_headers, Mapping) and not isinstance(extra_headers, dict):
@@ -407,6 +425,7 @@ def _resolve_openai_settings(config: DictConfig) -> dict[str, Any]:
         "max_concurrency": max_concurrency,
         "thinking_mode": thinking_mode,
         "reasoning_effort": reasoning_effort,
+        "use_responses_api": use_responses_api,
         "extra_headers": extra_headers,
     }
 
@@ -509,6 +528,51 @@ def _merge_reasoning_and_content(reasoning: str, content: str) -> str:
     if not content:
         return reasoning
     return f"{reasoning}\n\n{content}"
+
+
+def _normalize_responses_api_result(response: Any) -> Any:
+    dumped = response.model_dump() if hasattr(response, "model_dump") else {}
+
+    output_text = getattr(response, "output_text", None) or dumped.get("output_text") or ""
+
+    reasoning_text = None
+    reasoning = dumped.get("reasoning") or {}
+    if isinstance(reasoning, dict):
+        reasoning_text = _stringify_reasoning(reasoning.get("summary"))
+
+    if not reasoning_text:
+        for item in dumped.get("output") or []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "reasoning":
+                reasoning_text = _stringify_reasoning(item.get("summary") or item.get("content"))
+                if reasoning_text:
+                    break
+
+    finish_reason = "stop"
+    incomplete = dumped.get("incomplete_details") or {}
+    if isinstance(incomplete, dict) and incomplete:
+        reason = incomplete.get("reason") or incomplete.get("type")
+        finish_reason = "length" if reason in ("max_output_tokens", "max_tokens") else str(reason)
+    elif dumped.get("status") and dumped.get("status") != "completed":
+        finish_reason = str(dumped.get("status"))
+
+    message_extra = {}
+    completion_extra = {}
+    if reasoning_text:
+        message_extra["reasoning_content"] = reasoning_text
+        completion_extra["reasoning_content"] = reasoning_text
+
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content=output_text, model_extra=message_extra),
+                finish_reason=finish_reason,
+                model_extra={},
+            )
+        ],
+        model_extra=completion_extra,
+    )
 
 def _get_model_runner_workers(vllm_config, init_ray: bool = True):
     assert vllm_config.instance_id is not None, "instance_id must be set for external ray actors."
@@ -702,6 +766,7 @@ class AsyncvLLMEngine:
         self.engine: AsyncLLM = None
         self.client: AsyncOpenAI | None = None
         self.openai_model: str | None = None
+        self.use_responses_api = False
         self._openai_semaphore: asyncio.Semaphore | None = None
         self.thinking_mode = False
         self.reasoning_effort = None
@@ -722,6 +787,8 @@ class AsyncvLLMEngine:
         if not settings["api_key"]:
             raise ValueError("OpenAI API key is not configured. Set rollout.openai.api_key or OPENAI_API_KEY.")
         self.openai_model = settings["model"]
+        self.openai_timeout = settings["timeout"]  # Store for per-request HTTP timeout
+        self.use_responses_api = settings.get("use_responses_api", False)
         self._openai_semaphore = asyncio.Semaphore(settings["max_concurrency"])
         self.thinking_mode = settings["thinking_mode"]
         self.reasoning_effort = settings.get("reasoning_effort")
@@ -757,42 +824,52 @@ class AsyncvLLMEngine:
         if self.client is None or self.openai_model is None:
             raise RuntimeError("OpenAI client is not initialized. Call init_engine first.")
 
-        # Reasoning models (e.g. GPT-5.4) require max_completion_tokens instead of max_tokens
-        use_reasoning = bool(self.reasoning_effort)
-        payload: dict[str, Any] = {
-            "model": self.openai_model,
-            "messages": messages,
-        }
-        if use_reasoning:
-            payload["max_completion_tokens"] = max_tokens
-            payload["reasoning_effort"] = self.reasoning_effort
-        else:
-            payload["max_tokens"] = max_tokens
-        if sampling_params.get("temperature") is not None:
-            payload["temperature"] = sampling_params.get("temperature")
-        # Reasoning models (e.g. GPT-5.4) reject top_p, presence_penalty,
-        # frequency_penalty, and seed — skip them when reasoning_effort is set.
-        if not use_reasoning:
-            if sampling_params.get("top_p") is not None:
-                payload["top_p"] = sampling_params.get("top_p")
-            if sampling_params.get("presence_penalty") is not None:
-                payload["presence_penalty"] = sampling_params.get("presence_penalty")
-            if sampling_params.get("frequency_penalty") is not None:
-                payload["frequency_penalty"] = sampling_params.get("frequency_penalty")
-            if sampling_params.get("seed") is not None:
-                payload["seed"] = sampling_params.get("seed")
-        if sampling_params.get("stop") is not None:
-            payload["stop"] = sampling_params.get("stop")
-        # Reasoning models (e.g. GPT-5.4) also reject logprobs — skip it.
-        if not use_reasoning:
-            if sampling_params.get("logprobs"):
-                payload["logprobs"] = True
-                payload["top_logprobs"] = 1
-        if timeout is not None:
-            payload["timeout"] = timeout
-
         semaphore = self._openai_semaphore or asyncio.Semaphore(1)
         async with semaphore:
+            if self.use_responses_api:
+                payload: dict[str, Any] = {
+                    "model": self.openai_model,
+                    "input": messages,
+                    "max_output_tokens": max_tokens,
+                }
+                if self.reasoning_effort:
+                    payload["reasoning"] = {"effort": self.reasoning_effort}
+                http_timeout = getattr(self, "openai_timeout", None) or timeout
+                if http_timeout is not None:
+                    payload["timeout"] = http_timeout
+                response = await self.client.responses.create(**payload)
+                return _normalize_responses_api_result(response)
+
+            # Reasoning models (e.g. GPT-5.4) require max_completion_tokens instead of max_tokens
+            use_reasoning = bool(self.reasoning_effort)
+            payload = {
+                "model": self.openai_model,
+                "messages": messages,
+            }
+            if use_reasoning:
+                payload["max_completion_tokens"] = max_tokens
+                payload["reasoning_effort"] = self.reasoning_effort
+            else:
+                payload["max_tokens"] = max_tokens
+            if sampling_params.get("temperature") is not None:
+                payload["temperature"] = sampling_params.get("temperature")
+            if not use_reasoning:
+                if sampling_params.get("top_p") is not None:
+                    payload["top_p"] = sampling_params.get("top_p")
+                if sampling_params.get("presence_penalty") is not None:
+                    payload["presence_penalty"] = sampling_params.get("presence_penalty")
+                if sampling_params.get("frequency_penalty") is not None:
+                    payload["frequency_penalty"] = sampling_params.get("frequency_penalty")
+                if sampling_params.get("seed") is not None:
+                    payload["seed"] = sampling_params.get("seed")
+            if sampling_params.get("stop") is not None:
+                payload["stop"] = sampling_params.get("stop")
+            if not use_reasoning and sampling_params.get("logprobs"):
+                payload["logprobs"] = True
+                payload["top_logprobs"] = 1
+            http_timeout = getattr(self, "openai_timeout", None) or timeout
+            if http_timeout is not None:
+                payload["timeout"] = http_timeout
             return await self.client.chat.completions.create(**payload)
 
     async def wake_up(self):
@@ -1314,6 +1391,7 @@ class MultiIterAsyncvLLMEngine:
         self.engine = None
         self.client: AsyncOpenAI | None = None
         self.openai_model: str | None = None
+        self.use_responses_api = False
         self._openai_semaphore: asyncio.Semaphore | None = None
         self.thinking_mode = False
         self.reasoning_effort = None
@@ -1605,6 +1683,8 @@ class MultiIterAsyncvLLMEngine:
         if not settings["api_key"]:
             raise ValueError("OpenAI API key is not configured. Set rollout.openai.api_key or OPENAI_API_KEY.")
         self.openai_model = settings["model"]
+        self.openai_timeout = settings["timeout"]  # Store for per-request HTTP timeout
+        self.use_responses_api = settings.get("use_responses_api", False)
         self._openai_semaphore = asyncio.Semaphore(settings["max_concurrency"])
         self.thinking_mode = settings["thinking_mode"]
         self.reasoning_effort = settings.get("reasoning_effort")
@@ -1648,42 +1728,55 @@ class MultiIterAsyncvLLMEngine:
         if self.client is None or self.openai_model is None:
             raise RuntimeError("OpenAI client is not initialized. Call init_engine first.")
 
-        # Reasoning models (e.g. GPT-5.4) require max_completion_tokens instead of max_tokens
-        use_reasoning = bool(self.reasoning_effort)
-        payload: dict[str, Any] = {
-            "model": self.openai_model,
-            "messages": messages,
-        }
-        if use_reasoning:
-            payload["max_completion_tokens"] = max_tokens
-            payload["reasoning_effort"] = self.reasoning_effort
-        else:
-            payload["max_tokens"] = max_tokens
-        if sampling_params.get("temperature") is not None:
-            payload["temperature"] = sampling_params.get("temperature")
-        # Reasoning models (e.g. GPT-5.4) reject top_p, presence_penalty,
-        # frequency_penalty, and seed — skip them when reasoning_effort is set.
-        if not use_reasoning:
-            if sampling_params.get("top_p") is not None:
-                payload["top_p"] = sampling_params.get("top_p")
-            if sampling_params.get("presence_penalty") is not None:
-                payload["presence_penalty"] = sampling_params.get("presence_penalty")
-            if sampling_params.get("frequency_penalty") is not None:
-                payload["frequency_penalty"] = sampling_params.get("frequency_penalty")
-            if sampling_params.get("seed") is not None:
-                payload["seed"] = sampling_params.get("seed")
-        if sampling_params.get("stop") is not None:
-            payload["stop"] = sampling_params.get("stop")
-        # Reasoning models (e.g. GPT-5.4) also reject logprobs — skip it.
-        if not use_reasoning:
-            if sampling_params.get("logprobs"):
-                payload["logprobs"] = True
-                payload["top_logprobs"] = 1
-        if timeout is not None:
-            payload["timeout"] = timeout
-
         semaphore = self._openai_semaphore or asyncio.Semaphore(1)
         async with semaphore:
+            if self.use_responses_api:
+                payload: dict[str, Any] = {
+                    "model": self.openai_model,
+                    "input": messages,
+                    "max_output_tokens": max_tokens,
+                }
+                if self.reasoning_effort:
+                    payload["reasoning"] = {"effort": self.reasoning_effort}
+                http_timeout = getattr(self, 'openai_timeout', None) or timeout
+                if http_timeout is not None:
+                    payload["timeout"] = http_timeout
+                response = await self.client.responses.create(**payload)
+                return _normalize_responses_api_result(response)
+
+            use_reasoning = bool(self.reasoning_effort)
+            payload: dict[str, Any] = {
+                "model": self.openai_model,
+                "messages": messages,
+            }
+            if use_reasoning:
+                payload["max_completion_tokens"] = max_tokens
+                payload["reasoning_effort"] = self.reasoning_effort
+            else:
+                payload["max_tokens"] = max_tokens
+            if sampling_params.get("temperature") is not None:
+                payload["temperature"] = sampling_params.get("temperature")
+            if not use_reasoning:
+                if sampling_params.get("top_p") is not None:
+                    payload["top_p"] = sampling_params.get("top_p")
+                if sampling_params.get("presence_penalty") is not None:
+                    payload["presence_penalty"] = sampling_params.get("presence_penalty")
+                if sampling_params.get("frequency_penalty") is not None:
+                    payload["frequency_penalty"] = sampling_params.get("frequency_penalty")
+                if sampling_params.get("seed") is not None:
+                    payload["seed"] = sampling_params.get("seed")
+            if sampling_params.get("stop") is not None:
+                payload["stop"] = sampling_params.get("stop")
+            if not use_reasoning:
+                if sampling_params.get("logprobs"):
+                    payload["logprobs"] = True
+                    payload["top_logprobs"] = 1
+            # Use the configured HTTP timeout (self.openai_timeout), NOT the asyncio wrapper timeout.
+            # The asyncio timeout passed in here accounts for semaphore queuing and must be much larger;
+            # passing it to the HTTP client would cause hung connections to linger for hours.
+            http_timeout = getattr(self, 'openai_timeout', None) or timeout
+            if http_timeout is not None:
+                payload["timeout"] = http_timeout
             return await self.client.chat.completions.create(**payload)
 
     def _resolve_multi_turn_rewards(self, turn_rewards: list[float], turn_speedups: list[float], turn_correctness: list[bool]) -> list[float]:
@@ -2031,8 +2124,12 @@ class MultiIterAsyncvLLMEngine:
         messages = _normalize_messages(messages)
         try:
             if async_timeout is None:
-                # Fallback timeout: use 2x openai_timeout (or 1800s) to prevent hanging forever
-                fallback_timeout = max(getattr(self, 'openai_timeout', 900) * 2, 1800)
+                # Fallback timeout for asyncio.wait_for: must be large enough to cover semaphore
+                # queuing time + actual API call time. With N tasks and max_concurrency C, the
+                # last task can wait up to (N/C) * api_timeout before acquiring the semaphore.
+                # Use a very large fallback (10h) to prevent premature timeout while tasks queue.
+                openai_timeout = getattr(self, 'openai_timeout', 900) or 900
+                fallback_timeout = max(openai_timeout * 2, 36000)  # 10h covers any realistic queue
                 logging.info(f"Request {request_id}: async_timeout is None, using fallback timeout={fallback_timeout}s")
                 completion = await asyncio.wait_for(
                     self._openai_chat_completion(
@@ -2106,9 +2203,40 @@ class MultiIterAsyncvLLMEngine:
 
         self.clear_request_tracking(request_id)
 
-        response = completion.choices[0].message.content or ""
+        # Guard: if the response isn't a proper ChatCompletion object (e.g. the
+        # proxy returned HTML or a raw error string), treat it as a request error.
+        if not hasattr(completion, "choices"):
+            err_msg = str(completion)[:500]
+            logging.error(
+                f"[API ERROR] Request {request_id}: unexpected completion type "
+                f"{type(completion).__name__} — likely a wrong base_url or proxy "
+                f"misconfiguration. Body: {err_msg}"
+            )
+            return (
+                None, None, 0.0, 0.0, True, False, 0.0,
+                {"finish_type": FinishReasonTypeEnum.ERROR, "error": f"unexpected completion type: {err_msg}"},
+                [], [], prompt_ids, {}, None,
+            )
+
+        raw_content = completion.choices[0].message.content
         reasoning_text = None
-        if self.thinking_mode:
+        # Handle Anthropic-style list content (thinking + text blocks).
+        # Some proxies forward the raw block list even through the OpenAI-compatible endpoint.
+        if isinstance(raw_content, list):
+            text_parts = [
+                b.get("text", "") for b in raw_content
+                if isinstance(b, dict) and b.get("type") == "text"
+            ]
+            response = "\n".join(text_parts)
+            thinking_parts = [
+                b.get("thinking", "") for b in raw_content
+                if isinstance(b, dict) and b.get("type") == "thinking"
+            ]
+            if thinking_parts:
+                reasoning_text = "\n".join(thinking_parts)
+        else:
+            response = raw_content or ""
+        if self.thinking_mode and reasoning_text is None:
             reasoning_text = _extract_reasoning_text_from_completion(completion)
         print(f"[DEBUG] reasoning_text I: {reasoning_text}")
         response_token_ids = self.tokenizer.encode(response, add_special_tokens=False)

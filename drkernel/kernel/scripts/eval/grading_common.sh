@@ -84,6 +84,7 @@ OPENAI_BASE_URL=${OPENAI_BASE_URL:-""}
 OPENAI_TIMEOUT=${OPENAI_TIMEOUT:-120}
 OPENAI_MAX_RETRIES=${OPENAI_MAX_RETRIES:-3}
 OPENAI_MAX_CONCURRENCY=${OPENAI_MAX_CONCURRENCY:-64}
+OPENAI_USE_RESPONSES_API=${OPENAI_USE_RESPONSES_API:-False}
 OPENAI_EXTRA_HEADERS=${OPENAI_EXTRA_HEADERS:-"{}"}
 
 # Reward Manager Configuration
@@ -464,6 +465,7 @@ run_grading() {
       actor_rollout_ref.rollout.openai.timeout=$OPENAI_TIMEOUT \
       actor_rollout_ref.rollout.openai.max_retries=$OPENAI_MAX_RETRIES \
       actor_rollout_ref.rollout.openai.max_concurrency=$OPENAI_MAX_CONCURRENCY \
+      +actor_rollout_ref.rollout.openai.use_responses_api=$OPENAI_USE_RESPONSES_API \
       +actor_rollout_ref.rollout.openai.extra_headers="$OPENAI_EXTRA_HEADERS" \
       reward_model.reward_manager=$REWARD_MANAGER \
       reward_model.reference_backend=$REFERENCE_BACKEND \

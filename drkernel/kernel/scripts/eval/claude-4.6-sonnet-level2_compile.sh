@@ -1,10 +1,17 @@
 #!/bin/bash
 # =============================================================================
-# Claude Opus 4.6 via GitHub Copilot — KernelGYM Evaluation Script
+# Claude Sonnet 4.6 (thinking) via weelinking.com proxy — KernelGYM Evaluation
 # =============================================================================
-# Uses GitHub Copilot API (api.githubcopilot.com) to access Claude Opus 4.6
-# for Triton kernel generation. Requires an active OpenCode OAuth token
-# cached at ~/.local/share/opencode/auth.json.
+# Uses https://api.weelinking.com as the OpenAI-compatible proxy to access
+# claude-sonnet-4-6-thinking with Extended Thinking enabled.
+#
+# Prerequisites:
+#   export ANTHROPIC_AUTH_TOKEN="<your-key>"
+#
+# The proxy exposes both Anthropic (/v1/messages) and OpenAI-compatible
+# (/v1/chat/completions) endpoints. This script uses the OpenAI-compatible
+# path (BACKEND=openai) since the KernelGYM framework supports it natively,
+# including multi-turn rollout and thinking-mode token handling.
 #
 # Output is saved to /mnt/hstorage/GKG/datasets/distill/ for distillation.
 # =============================================================================
@@ -16,7 +23,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/grading_common.sh"
 
 PROJECT_NAME="kernel-grading"
-RUN_NAME="claude-opus-4.6-copilot"
+RUN_NAME="claude-sonnet-4.6-thinking-weelinking"
 EXPERIMENT_NAME=${RUN_NAME}
 
 REFERENCE_BACKEND="torch_compile"
@@ -24,7 +31,7 @@ REFERENCE_BACKEND="torch_compile"
 HDFS_RUNS_PATH="/mnt/hstorage/GKG/datasets/distill"
 # Use 10-row subset for small-scale testing (switch to full dataset for production)
 # EVAL_DATASET="/mnt/hstorage/GKG/datasets/structured_datasets/drkernel/drkernel-validation-data/validation_data_thinking.parquet"
-EVAL_DATASET="/mnt/hstorage/GKG/datasets/structured_datasets/drkernel/drkernel-validation-data/validation_data_thinking_10.parquet"
+EVAL_DATASET="/mnt/hstorage/GKG/datasets/structured_datasets/drkernel/drkernel-validation-data/validation_data_thinking_matmul_precision_mini10.parquet"
 
 MULTI_TURN=True
 MAX_USER_TURNS=3
@@ -68,39 +75,36 @@ SOLVE_THRESHOLD=0.99
 PASS_AT_K=1
 
 # =============================================================================
-# GitHub Copilot API Configuration
+# Anthropic Proxy API Configuration (weelinking.com)
+# =============================================================================
+# Uses OpenAI-compatible endpoint (/v1/chat/completions) so BACKEND=openai.
+# The proxy routes to Anthropic automatically based on the model name.
+# Set ANTHROPIC_AUTH_TOKEN in your environment before running this script.
 # =============================================================================
 BACKEND="openai"
-OPENAI_MODEL="claude-opus-4.6"
+OPENAI_MODEL="claude-sonnet-4-6-thinking"
 
-# Dynamically read OAuth token from OpenCode's auth cache
-AUTH_FILE="$HOME/.local/share/opencode/auth.json"
-if [[ -f "$AUTH_FILE" ]]; then
-  OPENAI_API_KEY=$(python3 -c "import json; print(json.load(open('$AUTH_FILE'))['github-copilot']['access'])" 2>/dev/null)
-  if [[ -z "$OPENAI_API_KEY" ]]; then
-    echo "ERROR: Failed to extract token from $AUTH_FILE"
-    exit 1
-  fi
-  echo "GitHub Copilot token loaded from $AUTH_FILE"
-else
-  echo "ERROR: OpenCode auth file not found at $AUTH_FILE"
-  echo "Please run 'opencode' first to authenticate with GitHub Copilot."
+# Read API key from ANTHROPIC_AUTH_TOKEN env variable
+if [[ -z "${ANTHROPIC_AUTH_TOKEN}" ]]; then
+  echo "ERROR: ANTHROPIC_AUTH_TOKEN is not set."
+  echo "Please run: export ANTHROPIC_AUTH_TOKEN=\"<your-key>\""
   exit 1
 fi
+OPENAI_API_KEY="${ANTHROPIC_AUTH_TOKEN}"
 
-OPENAI_BASE_URL="https://api.githubcopilot.com"
-OPENAI_TIMEOUT=180
+OPENAI_BASE_URL="https://api.weelinking.com/v1"
+OPENAI_TIMEOUT=360
 OPENAI_MAX_RETRIES=5
-# Conservative concurrency for free Copilot plan
-OPENAI_MAX_CONCURRENCY=5
+OPENAI_MAX_CONCURRENCY=8
 
-# Required headers for GitHub Copilot API
-OPENAI_EXTRA_HEADERS="{User-Agent: opencode/0.1, Openai-Intent: conversation-edits, x-initiator: user}"
+# Enable Extended Thinking — the framework passes this as
+# actor_rollout_ref.rollout.openai.thinking_mode=True to the OpenAI engine.
+OPENAI_THINKING_MODE=True
 
 # =============================================================================
 # Sandbox / Reward Configuration
 # =============================================================================
-REWARD_SERVER_URL="${REWARD_SERVER_URL:-${KERNELGYM_SERVER_URL:-"http://192.168.31.68:8001"}}"
+REWARD_SERVER_URL="${REWARD_SERVER_URL:-${KERNELGYM_SERVER_URL:-"http://192.168.31.68:8002"}}"
 
 REWARD_MANAGER="kernel_async"
 REWARD_FUNC_NAME="calculate_reward_speedup"
@@ -127,7 +131,7 @@ CUSTOM_REWARD_NAME="compute_kernel_reward_batch"
 
 NNODES=1
 # OpenAI backend does not need local GPUs — all inference is via API
-N_GPUS_PER_NODE=0
+N_GPUS_PER_NODE=1
 
 FIX_QWEN3_CHAT_TEMPLATE=False
 
@@ -153,6 +157,9 @@ export DO_SAMPLE
 export ROLLOUT_MODE
 export ROLLOUT_GPU_MEMORY_UTIL
 export ROLLOUT_TENSOR_MODEL_PARALLEL_SIZE
+
+export OPENAI_API_KEY
+export OPENAI_THINKING_MODE
 
 export SOLVE_THRESHOLD
 export PASS_AT_K
