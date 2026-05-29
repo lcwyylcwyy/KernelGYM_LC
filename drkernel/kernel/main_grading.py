@@ -64,6 +64,169 @@ def _json_default(obj):
         return bool(obj)
     return str(obj)
 
+
+def _normalize_prompt_index(prompt_index):
+    if isinstance(prompt_index, np.generic):
+        return prompt_index.item()
+    return prompt_index
+
+
+def _extract_completed_prompt_indices(dataproto: Optional[DataProto]) -> set:
+    if dataproto is None:
+        return set()
+
+    prompt_indices = dataproto.non_tensor_batch.get("prompt_index")
+    if prompt_indices is None:
+        return set()
+
+    if hasattr(prompt_indices, "tolist"):
+        prompt_indices = prompt_indices.tolist()
+
+    return {
+        _normalize_prompt_index(prompt_index)
+        for prompt_index in prompt_indices
+        if prompt_index is not None
+    }
+
+
+def _save_dataproto_checkpoint(dataproto: DataProto, filepath: str) -> None:
+    tmp_filepath = f"{filepath}.tmp"
+    if os.path.exists(tmp_filepath):
+        os.remove(tmp_filepath)
+    dataproto.save_to_disk(tmp_filepath)
+    os.replace(tmp_filepath, filepath)
+
+
+def _accumulate_reward_extra_metrics(
+    batch: DataProto,
+    reward_extra_info_dict: defaultdict,
+) -> None:
+    reward_tensor = batch.batch.get("token_level_scores")
+    if reward_tensor is None:
+        return
+
+    cur_data_source = batch.non_tensor_batch.get(
+        "data_source", ["unknown"] * reward_tensor.shape[0]
+    )
+    reward_extra_info_raw = batch.non_tensor_batch.get("reward_extra_info")
+    if reward_extra_info_raw is None:
+        reward_extra_info_list = []
+    elif hasattr(reward_extra_info_raw, "tolist"):
+        reward_extra_info_list = reward_extra_info_raw.tolist()
+    else:
+        reward_extra_info_list = list(reward_extra_info_raw)
+
+    valid_indices = []
+    for i, info in enumerate(reward_extra_info_list):
+        if len(info) == 0:
+            continue
+        has_kernel_metrics = any(
+            key in info
+            for key in ["correctness", "performance", "compiled", "success"]
+        )
+        if has_kernel_metrics:
+            valid_indices.append(i)
+
+    if not valid_indices:
+        return
+
+    valid_reward_extra_info_list = [reward_extra_info_list[i] for i in valid_indices]
+    valid_data_sources = [cur_data_source[i] for i in valid_indices]
+
+    raw_reward_extra_info_dict = {
+        key: [info[key] for info in valid_reward_extra_info_list]
+        for key in valid_reward_extra_info_list[0].keys()
+    }
+
+    for key, extra_reward in raw_reward_extra_info_dict.items():
+        for i, data_source in enumerate(valid_data_sources):
+            composed_key = f"{key}_{data_source}"
+            reward_extra_info_dict[composed_key].append(extra_reward[i])
+
+
+def _extend_raw_response_logs(
+    batch: DataProto,
+    tokenizer,
+    input_texts: list,
+    output_texts: list,
+) -> None:
+    if "input_ids" not in batch.batch or "responses" not in batch.batch:
+        return
+
+    input_texts.extend(
+        tokenizer.decode(ids, skip_special_tokens=True)
+        for ids in batch.batch["input_ids"]
+    )
+    output_texts.extend(
+        tokenizer.decode(ids, skip_special_tokens=True)
+        for ids in batch.batch["responses"]
+    )
+
+
+def _restore_multiturn_logging_from_dataproto(
+    batch: DataProto,
+    tokenizer,
+    sample_inputs: list,
+    sample_outputs: list,
+    sample_scores: list,
+    uid_to_conversation: dict,
+) -> None:
+    if "turn_indices" not in batch.batch:
+        return
+
+    uids = batch.non_tensor_batch.get("uid")
+    if uids is None:
+        return
+
+    turn_indices = batch.batch["turn_indices"].cpu().numpy()
+    multiturn_messages = batch.non_tensor_batch.get("multiturn_messages", None)
+    token_level_scores = batch.batch.get("token_level_scores")
+    if token_level_scores is None:
+        scores = [0.0] * len(batch.batch)
+    else:
+        scores = token_level_scores.sum(-1).cpu().tolist()
+
+    sample_data = {}
+    for i in range(len(batch.batch)):
+        uid = uids[i]
+        turn_id = int(turn_indices[i])
+        if turn_id == -1:
+            continue
+
+        if uid not in sample_data:
+            sample_data[uid] = {"first_idx": i, "score": 0.0}
+        sample_data[uid]["score"] += scores[i]
+
+    for uid in sorted(sample_data.keys(), key=str):
+        first_idx = sample_data[uid]["first_idx"]
+        messages = None
+        if multiturn_messages is not None:
+            messages = multiturn_messages[first_idx]
+
+        if messages is not None:
+            first_user_msg = ""
+            for msg in messages:
+                if msg.get("role") == "user":
+                    first_user_msg = msg.get("content", "")
+                    break
+            full_output = ""
+            for msg in messages:
+                role = msg.get("role", "unknown")
+                content = msg.get("content", "")
+                full_output += f"[{role}]\n{content}\n\n"
+        else:
+            first_user_msg = tokenizer.decode(
+                batch.batch["prompts"][first_idx], skip_special_tokens=True
+            ) if "prompts" in batch.batch else ""
+            full_output = tokenizer.decode(
+                batch.batch["responses"][first_idx], skip_special_tokens=True
+            ) if "responses" in batch.batch else ""
+
+        sample_inputs.append(first_user_msg)
+        sample_outputs.append(full_output)
+        sample_scores.append(sample_data[uid]["score"])
+        uid_to_conversation[uid] = full_output
+
 def _parse_turn_id_from_filename(filename: str) -> int:
     """Extract numeric turn_id from a filename like turn_12_eval.json."""
     match = re.search(r"turn_(\d+)_eval\.json$", filename)
@@ -1337,13 +1500,19 @@ def main_task(config):
         collate_fn=collate_fn,
     )
 
-    # if dataproto_path exist, directly load it
+    resumed_dataproto = None
+    completed_prompt_indices = set()
+
+    # if dataproto_path exist, load it and continue from the remaining prompts
     if dataproto_path and os.path.exists(dataproto_path):
-        # read out the existing raw responses
-        print(f"Load DataProto from {dataproto_path}...")
-        all_dataproto = DataProto.load_from_disk(dataproto_path)
-        all_input_texts, all_output_texts = [], []  # Will be populated if needed
-    else:  # otherwise, generate responses
+        print(f"Loading DataProto checkpoint from {dataproto_path}...")
+        resumed_dataproto = DataProto.load_from_disk(dataproto_path)
+        completed_prompt_indices = _extract_completed_prompt_indices(resumed_dataproto)
+        print(
+            f"Resume checkpoint contains {len(completed_prompt_indices)} completed prompts."
+        )
+
+    if resumed_dataproto is None:  # otherwise, generate responses from scratch
         actor_rollout_config = config.actor_rollout_ref
         wg = None
         async_rollout_manager = None
@@ -2085,10 +2254,71 @@ def main_task(config):
     # Fix 1: UID-based conversation mapping for multi-turn alignment
     uid_to_conversation = {}  # Maps UID -> full conversation text
 
+    if resumed_dataproto is not None:
+        all_dataproto.append(resumed_dataproto)
+        if "token_level_scores" in resumed_dataproto.batch:
+            reward_tensor_lst.append(resumed_dataproto.batch["token_level_scores"])
+            data_source_lst.append(
+                resumed_dataproto.non_tensor_batch.get(
+                    "data_source",
+                    np.array(["unknown"] * len(resumed_dataproto), dtype=object),
+                )
+            )
+            _accumulate_reward_extra_metrics(resumed_dataproto, reward_extra_info_dict)
+        _extend_raw_response_logs(
+            resumed_dataproto,
+            tokenizer,
+            all_input_texts,
+            all_output_texts,
+        )
+        if multi_turn_enabled:
+            _restore_multiturn_logging_from_dataproto(
+                resumed_dataproto,
+                tokenizer,
+                sample_inputs,
+                sample_outputs,
+                sample_scores,
+                uid_to_conversation,
+            )
+
     for test_data in dataloader:
 
         print(f"Processing batch {progress_counter}...")
         test_batch = DataProto.from_single_dict(test_data)
+
+        batch_prompt_indices = []
+        prompt_indices_array = test_batch.non_tensor_batch.get("prompt_index")
+        if prompt_indices_array is not None:
+            batch_prompt_indices = [
+                _normalize_prompt_index(prompt_index)
+                for prompt_index in prompt_indices_array.tolist()
+            ]
+
+        if completed_prompt_indices and batch_prompt_indices:
+            keep_mask = np.array(
+                [
+                    prompt_index not in completed_prompt_indices
+                    for prompt_index in batch_prompt_indices
+                ],
+                dtype=bool,
+            )
+            skipped_count = int((~keep_mask).sum())
+            if skipped_count == len(keep_mask):
+                print(
+                    f"Skipping batch {progress_counter}: all {skipped_count} prompts already exist in the checkpoint."
+                )
+                progress_counter += 1
+                continue
+            if skipped_count > 0:
+                print(
+                    f"Resuming batch {progress_counter}: skipping {skipped_count} completed prompts and keeping {int(keep_mask.sum())}."
+                )
+                test_batch = test_batch[keep_mask]
+                batch_prompt_indices = [
+                    prompt_index
+                    for prompt_index, keep in zip(batch_prompt_indices, keep_mask, strict=True)
+                    if keep
+                ]
 
         # CRITICAL: Convert uuid field FIRST before anything else
         # The vllm_async_engine reads "uuid" key (line 2169) and validates it as string
@@ -2442,42 +2672,7 @@ def main_task(config):
         else:
             reward_extra_info_list = list(reward_extra_info_raw)
 
-        valid_indices = []
-        for i, d in enumerate(reward_extra_info_list):
-            if len(d) > 0:
-                # Check if dict has kernel-specific metrics (not just error info)
-                has_kernel_metrics = any(
-                    key in d
-                    for key in [
-                        "correctness",
-                        "performance",
-                        "compiled",
-                        "success",
-                    ]
-                )
-                if has_kernel_metrics:
-                    valid_indices.append(i)
-
-        valid_reward_extra_info_list = [
-            reward_extra_info_list[i] for i in valid_indices
-        ]
-        valid_data_sources = [cur_data_source[i] for i in valid_indices]
-
-        # convert list of dict to dict of list (only for valid entries with kernel metrics)
-        if len(valid_reward_extra_info_list) > 0:
-            raw_reward_extra_info_dict = {
-                k: [d[k] for d in valid_reward_extra_info_list]
-                for k in valid_reward_extra_info_list[0].keys()
-            }
-
-            if reward_extra_info_dict is None:
-                reward_extra_info_dict = {}
-            for key, extra_reward in raw_reward_extra_info_dict.items():
-                for i, data_source in enumerate(valid_data_sources):
-                    composed_key = f"{key}_{data_source}"
-                    if composed_key not in reward_extra_info_dict:
-                        reward_extra_info_dict[composed_key] = []
-                    reward_extra_info_dict[composed_key].append(extra_reward[i])
+        _accumulate_reward_extra_metrics(test_batch, reward_extra_info_dict)
 
         scores = reward_tensor.sum(-1).cpu().tolist()
 
@@ -2518,6 +2713,19 @@ def main_task(config):
         # Accumulate batch data for final processing
         all_dataproto.append(test_batch)
 
+        completed_prompt_indices.update(batch_prompt_indices)
+
+        if dataproto_path:
+            checkpoint_dataproto = (
+                all_dataproto[0]
+                if len(all_dataproto) == 1
+                else DataProto.concat(all_dataproto)
+            )
+            print(
+                f"Saving resumable checkpoint to {dataproto_path} ({len(completed_prompt_indices)} prompts complete)..."
+            )
+            _save_dataproto_checkpoint(checkpoint_dataproto, dataproto_path)
+
         # For raw response logging - decode all inputs/outputs
         input_ids_for_logging = test_batch.batch['input_ids']
         input_texts = [tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids_for_logging]
@@ -2539,12 +2747,19 @@ def main_task(config):
         except Exception as e:
             print(f"[SameGPUMode] Final vLLM sleep failed (non-fatal): {e}")
 
-    all_dataproto = DataProto.concat(all_dataproto)
+    if not all_dataproto:
+        raise RuntimeError("No evaluation data available after applying resume filters.")
+
+    all_dataproto = (
+        all_dataproto[0]
+        if len(all_dataproto) == 1
+        else DataProto.concat(all_dataproto)
+    )
 
     if dataproto_path:
         # write the test batch into dataproto_path if we specified dataproto_path
         print(f"Saving DataProto to {dataproto_path}...")
-        all_dataproto.save_to_disk(dataproto_path)
+        _save_dataproto_checkpoint(all_dataproto, dataproto_path)
 
     if raw_response_path:
         samples = list(zip(all_input_texts, all_output_texts))
@@ -2731,8 +2946,7 @@ def main_task(config):
     # Save/append the final dataset to a JSONL file
     output_path = config.data.output_path
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    mode = 'a' if os.path.exists(output_path) else 'w'
-    with open(output_path, mode) as f:
+    with open(output_path, 'w') as f:
         for record in dataframe.to_dict(orient='records'):
             f.write(json.dumps(record, default=_json_default) + '\n')
 

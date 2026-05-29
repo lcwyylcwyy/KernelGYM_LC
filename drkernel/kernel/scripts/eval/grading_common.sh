@@ -35,6 +35,9 @@ FSDP_SIZE=${FSDP_SIZE:-1}                           # Optional: FSDP tensor mode
 GRADIO_VISUALIZATION=${GRADIO_VISUALIZATION:-False}
 GRADIO_SHARE=${GRADIO_SHARE:-True}
 VISUALIZE_ONLY=${VISUALIZE_ONLY:-False}
+RESUME_REQUESTED=${RESUME_REQUESTED:-False}
+FRESH_REQUESTED=${FRESH_REQUESTED:-False}
+OUTPUT_DIR_PREPARED=${OUTPUT_DIR_PREPARED:-False}
 
 MULTI_TURN=${MULTI_TURN:-False}
 MAX_USER_TURNS=${MAX_USER_TURNS:-3}
@@ -79,6 +82,7 @@ VLLM_KV_CACHE_DTYPE=${VLLM_KV_CACHE_DTYPE:-""}
 BACKEND=${BACKEND:-"vllm"}
 OPENAI_MODEL=${OPENAI_MODEL:-""}
 OPENAI_THINKING_MODE=${OPENAI_THINKING_MODE:-False}
+OPENAI_STREAM=${OPENAI_STREAM:-False}
 OPENAI_API_KEY=${OPENAI_API_KEY:-""}
 OPENAI_BASE_URL=${OPENAI_BASE_URL:-""}
 OPENAI_TIMEOUT=${OPENAI_TIMEOUT:-120}
@@ -223,6 +227,8 @@ show_help() {
   echo "  --raw_response_path PATH      Save raw responses JSONL"
   echo "  --metrics_output_path PATH    Save metrics JSON"
   echo "  --dataproto_path PATH         Cache/load DataProto"
+  echo "  --resume                     Continue from DataProto checkpoint when output exists"
+  echo "  --fresh, --restart           Back up existing output directory and start over"
   echo ""
   echo "Examples:"
   echo "  $0 --eval_dataset data.parquet --output_path results.parquet --model_path ~/models/qwen"
@@ -302,6 +308,8 @@ parse_arguments() {
       --gradio_visualization) GRADIO_VISUALIZATION="$2"; shift 2 ;;
       --gradio_share) GRADIO_SHARE="$2"; shift 2 ;;
       --visualize_only) VISUALIZE_ONLY="$2"; shift 2 ;;
+      --resume) RESUME_REQUESTED=True; shift ;;
+      --fresh|--restart) FRESH_REQUESTED=True; shift ;;
       *)
         echo "Unknown option: $1"
         echo "Use --help for usage information"
@@ -309,6 +317,82 @@ parse_arguments() {
         ;;
     esac
   done
+}
+
+ensure_dataproto_path() {
+  if [[ -z "$DATAPROTO_PATH" && -n "$OUTPUT_PATH" ]]; then
+    DATAPROTO_PATH="$(dirname "$OUTPUT_PATH")/resume_checkpoint.dp"
+  fi
+}
+
+backup_output_dir_for_fresh() {
+  local output_dir="$1"
+  local timestamp
+  local backup_dir
+
+  timestamp="$(date +%Y%m%d_%H%M%S)"
+  backup_dir="${output_dir}.backup_${timestamp}"
+  echo "Starting fresh. Moving existing output directory to: $backup_dir"
+  mv "$output_dir" "$backup_dir"
+}
+
+prepare_output_dir_for_resume() {
+  if [[ "$RESUME_REQUESTED" == "True" && "$FRESH_REQUESTED" == "True" ]]; then
+    echo "Error: --resume and --fresh/--restart are mutually exclusive"
+    exit 1
+  fi
+
+  if [[ "$OUTPUT_DIR_PREPARED" == "True" ]]; then
+    return
+  fi
+
+  local output_dir
+  output_dir="$(dirname "$OUTPUT_PATH")"
+
+  if [[ -d "$output_dir" && -n "$(find "$output_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+    if [[ "$RESUME_REQUESTED" == "True" ]]; then
+      echo "Resume requested. Reusing existing output directory: $output_dir"
+      echo "Checkpoint path: $DATAPROTO_PATH"
+      OUTPUT_DIR_PREPARED=True
+      return
+    fi
+
+    if [[ "$FRESH_REQUESTED" == "True" ]]; then
+      backup_output_dir_for_fresh "$output_dir"
+      OUTPUT_DIR_PREPARED=True
+      return
+    fi
+
+    if [[ ! -t 0 ]]; then
+      echo "Error: output directory already has content: $output_dir"
+      echo "Run with --resume to continue from checkpoint, or --fresh to back up the directory and start over."
+      exit 1
+    fi
+
+    echo "Output directory already has content: $output_dir"
+    echo "Choose how to proceed:"
+    echo "  r) resume from checkpoint"
+    echo "  f) fresh run; move existing directory to a timestamped backup"
+    echo "  a) abort"
+    read -r -p "Selection [r/f/a]: " selection
+
+    case "$selection" in
+      r|R)
+        RESUME_REQUESTED=True
+        echo "Resuming with checkpoint path: $DATAPROTO_PATH"
+        ;;
+      f|F)
+        FRESH_REQUESTED=True
+        backup_output_dir_for_fresh "$output_dir"
+        ;;
+      *)
+        echo "Aborted."
+        exit 1
+        ;;
+    esac
+  fi
+
+  OUTPUT_DIR_PREPARED=True
 }
 
 setup_grading_environment() {
@@ -465,6 +549,7 @@ run_grading() {
       actor_rollout_ref.rollout.openai.timeout=$OPENAI_TIMEOUT \
       actor_rollout_ref.rollout.openai.max_retries=$OPENAI_MAX_RETRIES \
       actor_rollout_ref.rollout.openai.max_concurrency=$OPENAI_MAX_CONCURRENCY \
+      +actor_rollout_ref.rollout.openai.stream=$OPENAI_STREAM \
       +actor_rollout_ref.rollout.openai.use_responses_api=$OPENAI_USE_RESPONSES_API \
       +actor_rollout_ref.rollout.openai.extra_headers="$OPENAI_EXTRA_HEADERS" \
       reward_model.reward_manager=$REWARD_MANAGER \
@@ -510,6 +595,8 @@ run_grading() {
 
 main() {
   parse_arguments "$@"
+  ensure_dataproto_path
+  prepare_output_dir_for_resume
   setup_grading_environment
   run_grading
 }
