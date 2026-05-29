@@ -57,6 +57,10 @@ Windows PowerShell equivalent:
 $env:KERNELGYM_RUN_PATH="C:/Users/OT/Downloads/GKG_Eval_Analysis/drkernel-8b-maxturns3_9060XT_compile/drkernel-8b-maxturns3_9060XT_compile"
 python app.py
 ```
+prompt analysis:
+```
+python statistic_board/turn_detail_dashboard.py --results-dir /home/chen/NVS/KernelGYM_LC/drkernel/kernel/scripts/eval/gpt-5.5-weelinking_0526/grading_results --host 172.17.2.155 --port 7860
+```
 
 You can pass either:
 

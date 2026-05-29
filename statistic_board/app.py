@@ -51,6 +51,57 @@ def get_default_run_path() -> str:
 
 DEFAULT_RUN_PATH = get_default_run_path()
 DEFAULT_METRIC_PREFIX_CHOICES = ["best_by_turn"]
+INDUCTOR_REFERENCE_DIR = Path(__file__).resolve().parent.parent / "data" / "drkernel-validation-data_reference"
+
+
+def _coerce_nonnegative_int(value: Any) -> int | None:
+    try:
+        numeric_value = int(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric_value if numeric_value >= 0 else None
+
+
+def build_inductor_reference_code_index(
+    inductor_reference_dir: Path = INDUCTOR_REFERENCE_DIR,
+) -> dict[int, dict[str, Any]]:
+    code_index: dict[int, dict[str, Any]] = {}
+    if not inductor_reference_dir.exists():
+        return code_index
+
+    for meta_path in sorted(inductor_reference_dir.glob("*.meta.json")):
+        try:
+            meta_payload = read_json_file(meta_path)
+        except Exception:
+            continue
+
+        dashboard_problem_id = _coerce_nonnegative_int(meta_payload.get("row_idx"))
+        if dashboard_problem_id is None or dashboard_problem_id in code_index:
+            continue
+
+        source_path = meta_path.with_suffix("").with_suffix(".py")
+        if not source_path.exists():
+            continue
+
+        code_index[dashboard_problem_id] = {
+            "row_idx": dashboard_problem_id,
+            "meta_problem_id": _coerce_nonnegative_int(meta_payload.get("problem_id")),
+            "meta_file": meta_path.name,
+            "source_path": str(source_path),
+            "code": source_path.read_text(encoding="utf-8", errors="replace"),
+        }
+
+    return code_index
+
+
+def get_inductor_reference_detail(
+    problem_id: Any,
+    code_index: dict[int, dict[str, Any]],
+) -> dict[str, Any]:
+    normalized_problem_id = _coerce_nonnegative_int(problem_id)
+    if normalized_problem_id is None:
+        return {}
+    return code_index.get(normalized_problem_id, {})
 
 
 def get_runtime_info_markdown(initial_run_path: str) -> str:
@@ -243,7 +294,10 @@ def _extract_turn_id(path: Path) -> int:
     return int(matched.group(1)) if matched else 10**9
 
 
-def build_eval_outputs_table(eval_outputs_dir: Path) -> tuple[pd.DataFrame, dict[str, dict[str, Any]]]:
+def build_eval_outputs_table(
+    eval_outputs_dir: Path,
+    inductor_reference_code_index: dict[int, dict[str, Any]],
+) -> tuple[pd.DataFrame, dict[str, dict[str, Any]]]:
     rows: list[dict[str, Any]] = []
     detail_map: dict[str, dict[str, Any]] = {}
 
@@ -285,6 +339,10 @@ def build_eval_outputs_table(eval_outputs_dir: Path) -> tuple[pd.DataFrame, dict
             reference_code = reference_path.read_text(encoding="utf-8", errors="replace")
         else:
             reference_code = ""
+        inductor_reference_detail = get_inductor_reference_detail(
+            problem_id,
+            inductor_reference_code_index,
+        )
 
         row = {
             "problem_id": problem_id,
@@ -305,6 +363,10 @@ def build_eval_outputs_table(eval_outputs_dir: Path) -> tuple[pd.DataFrame, dict
             "all_turn_evals": turn_evals,
             "conversation_text": conversation_text,
             "reference_code": reference_code,
+            "inductor_reference_code": str(inductor_reference_detail.get("code", "")),
+            "inductor_reference_row_idx": inductor_reference_detail.get("row_idx"),
+            "inductor_reference_meta_problem_id": inductor_reference_detail.get("meta_problem_id"),
+            "inductor_reference_meta_file": str(inductor_reference_detail.get("meta_file", "")),
         }
 
     if not rows:
@@ -460,7 +522,10 @@ def build_turn_payload_map(turn_items: list[dict[str, Any]]) -> dict[str, dict[s
     return payload_map
 
 
-def build_fast_filter_table(filter_result: dict[str, Any]) -> tuple[pd.DataFrame, dict[str, dict[str, Any]], str]:
+def build_fast_filter_table(
+    filter_result: dict[str, Any],
+    inductor_reference_code_index: dict[int, dict[str, Any]],
+) -> tuple[pd.DataFrame, dict[str, dict[str, Any]], str]:
     rows: list[dict[str, Any]] = []
     detail_map: dict[str, dict[str, Any]] = {}
 
@@ -488,6 +553,10 @@ def build_fast_filter_table(filter_result: dict[str, Any]) -> tuple[pd.DataFrame
             reference_path = Path(str(source_eval_output_dir)) / "reference.py"
             if reference_path.exists():
                 reference_code = reference_path.read_text(encoding="utf-8", errors="replace")
+        inductor_reference_detail = get_inductor_reference_detail(
+            problem_id,
+            inductor_reference_code_index,
+        )
 
         detail_map[uid] = {
             "item": item,
@@ -495,6 +564,10 @@ def build_fast_filter_table(filter_result: dict[str, Any]) -> tuple[pd.DataFrame
             "selected_kernel": selected_kernel,
             "selected_response": str(item.get("selected_response", "")),
             "reference_code": reference_code,
+            "inductor_reference_code": str(inductor_reference_detail.get("code", "")),
+            "inductor_reference_row_idx": inductor_reference_detail.get("row_idx"),
+            "inductor_reference_meta_problem_id": inductor_reference_detail.get("meta_problem_id"),
+            "inductor_reference_meta_file": str(inductor_reference_detail.get("meta_file", "")),
         }
 
     if rows:
@@ -535,9 +608,10 @@ def load_dashboard_data(run_path: str, threshold: float, metric_prefix: str):
         metrics = read_json_file(grading_results / "metrics.json")
         overview_df, overview_summary = extract_overview_metrics(metrics)
         turn_fast_df, best_by_turn_fast_df = extract_fast_trend_data(metrics)
+        inductor_reference_code_index = build_inductor_reference_code_index()
 
         eval_outputs_dir = grading_results / "eval_outputs"
-        eval_df, detail_map = build_eval_outputs_table(eval_outputs_dir)
+        eval_df, detail_map = build_eval_outputs_table(eval_outputs_dir, inductor_reference_code_index)
         conversations_path, metrics_path, eval_outputs_path = resolve_filter_inputs(grading_results)
         response_index = load_turn_response_index(conversations_path)
         detail_map = build_eval_outputs_detail_map(eval_outputs_dir, detail_map, response_index)
@@ -550,7 +624,10 @@ def load_dashboard_data(run_path: str, threshold: float, metric_prefix: str):
             metric_prefix=metric_prefix_value,
             threshold=float(threshold),
         )
-        filter_df, filter_detail_map, filter_summary_md = build_fast_filter_table(filter_result)
+        filter_df, filter_detail_map, filter_summary_md = build_fast_filter_table(
+            filter_result,
+            inductor_reference_code_index,
+        )
 
         status_md = (
             "### Loaded Successfully\n"
@@ -619,11 +696,11 @@ def load_dashboard_data(run_path: str, threshold: float, metric_prefix: str):
 
 def show_sample_detail(evt: gr.SelectData, eval_df: pd.DataFrame, detail_map: dict[str, dict[str, Any]]):
     if eval_df is None or len(eval_df) == 0:
-        return {}, "", "", gr.update(choices=[], value=None), "", "", {}
+        return {}, "", "", "", gr.update(choices=[], value=None), "", "", {}
 
     row_index = evt.index[0] if isinstance(evt.index, (list, tuple)) else int(evt.index)
     if row_index < 0 or row_index >= len(eval_df):
-        return {}, "", "", gr.update(choices=[], value=None), "", "", {}
+        return {}, "", "", "", gr.update(choices=[], value=None), "", "", {}
 
     sample_dir_name = str(eval_df.iloc[row_index]["sample_dir_name"])
     detail = detail_map.get(sample_dir_name, {})
@@ -631,17 +708,29 @@ def show_sample_detail(evt: gr.SelectData, eval_df: pd.DataFrame, detail_map: di
     turn_items = detail.get("turn_items", [])
     detail_json = {
         "sample_dir_name": sample_dir_name,
+        "inductor_lookup_problem_id": _coerce_nonnegative_int(
+            eval_df.iloc[row_index]["problem_id"]
+        ),
+        "inductor_reference_row_idx": _coerce_nonnegative_int(
+            detail.get("inductor_reference_row_idx")
+        ),
+        "inductor_reference_meta_problem_id": _coerce_nonnegative_int(
+            detail.get("inductor_reference_meta_problem_id")
+        ),
+        "inductor_reference_meta_file": detail.get("inductor_reference_meta_file", ""),
         "turn_metrics": build_turn_metrics_summary(turn_items),
     }
-    conversation_text = detail.get("conversation_text", "")
     reference_code = detail.get("reference_code", "")
+    inductor_reference_code = detail.get("inductor_reference_code", "")
+    conversation_text = detail.get("conversation_text", "")
     kernel_code, response_text, selected_turn_id, all_turn_ids = _pick_turn_payload(detail, turn_id=None)
     turn_dropdown_update = gr.update(choices=all_turn_ids, value=selected_turn_id)
     turn_payload_map = build_turn_payload_map(turn_items)
     return (
         detail_json,
-        conversation_text,
         reference_code,
+        inductor_reference_code,
+        conversation_text,
         turn_dropdown_update,
         kernel_code,
         response_text,
@@ -669,11 +758,11 @@ def show_eval_turn_content(
 
 def show_filtered_detail(evt: gr.SelectData, filter_df: pd.DataFrame, filter_detail_map: dict[str, dict[str, Any]]):
     if filter_df is None or len(filter_df) == 0:
-        return {}, "", "", "", ""
+        return {}, "", "", "", "", ""
 
     row_index = evt.index[0] if isinstance(evt.index, (list, tuple)) else int(evt.index)
     if row_index < 0 or row_index >= len(filter_df):
-        return {}, "", "", "", ""
+        return {}, "", "", "", "", ""
 
     uid = str(filter_df.iloc[row_index]["uid"])
     detail = filter_detail_map.get(uid, {})
@@ -681,6 +770,14 @@ def show_filtered_detail(evt: gr.SelectData, filter_df: pd.DataFrame, filter_det
     detail_json = {
         "uid": uid,
         "problem_id": item.get("problem_id"),
+        "inductor_lookup_problem_id": _coerce_nonnegative_int(item.get("problem_id")),
+        "inductor_reference_row_idx": _coerce_nonnegative_int(
+            detail.get("inductor_reference_row_idx")
+        ),
+        "inductor_reference_meta_problem_id": _coerce_nonnegative_int(
+            detail.get("inductor_reference_meta_problem_id")
+        ),
+        "inductor_reference_meta_file": detail.get("inductor_reference_meta_file", ""),
         "sample_id": item.get("sample_id"),
         "qualified_turn_id": item.get("qualified_turn_id"),
         "qualified_turn_performance": item.get("qualified_turn_performance"),
@@ -689,10 +786,11 @@ def show_filtered_detail(evt: gr.SelectData, filter_df: pd.DataFrame, filter_det
     }
     return (
         detail_json,
+        detail.get("reference_code", ""),
+        detail.get("inductor_reference_code", ""),
         detail.get("conversation_text", ""),
         detail.get("selected_kernel", ""),
         detail.get("selected_response", ""),
-        detail.get("reference_code", ""),
     )
 
 
@@ -744,17 +842,24 @@ def build_app(initial_run_path: str = DEFAULT_RUN_PATH) -> gr.Blocks:
         with gr.Tab("Eval Outputs"):
             eval_table = gr.Dataframe(label="All Samples", interactive=False, type="pandas")
             with gr.Row():
-                detail_json = gr.JSON(label="Selected Sample Detail")
-                conversation_box = gr.Textbox(
-                    label="Dialogue Log",
-                    lines=24,
-                    max_lines=36,
-                )
-                reference_code_box = gr.Code(
-                    label="Reference Code (reference.py)",
-                    language="python",
-                    interactive=False,
-                )
+                with gr.Column(scale=1):
+                    detail_json = gr.JSON(label="Selected Sample Detail")
+                with gr.Column(scale=2):
+                    reference_code_box = gr.Code(
+                        label="Reference Code (reference.py)",
+                        language="python",
+                        interactive=False,
+                    )
+                    inductor_reference_code_box = gr.Code(
+                        label="Inductor Triton Code",
+                        language="python",
+                        interactive=False,
+                    )
+                    conversation_box = gr.Textbox(
+                        label="Dialogue Log",
+                        lines=24,
+                        max_lines=36,
+                    )
             with gr.Row():
                 eval_turn_selector = gr.Dropdown(
                     label="Turn",
@@ -783,6 +888,11 @@ def build_app(initial_run_path: str = DEFAULT_RUN_PATH) -> gr.Blocks:
                 with gr.Column(scale=1):
                     filtered_reference_code_box = gr.Code(
                         label="Reference Code (reference.py)",
+                        language="python",
+                        interactive=False,
+                    )
+                    filtered_inductor_reference_code_box = gr.Code(
+                        label="Inductor Triton Code",
                         language="python",
                         interactive=False,
                     )
@@ -830,8 +940,9 @@ def build_app(initial_run_path: str = DEFAULT_RUN_PATH) -> gr.Blocks:
             inputs=[eval_table, detail_state],
             outputs=[
                 detail_json,
-                conversation_box,
                 reference_code_box,
+                inductor_reference_code_box,
+                conversation_box,
                 eval_turn_selector,
                 eval_turn_kernel_box,
                 eval_turn_response_box,
@@ -850,10 +961,11 @@ def build_app(initial_run_path: str = DEFAULT_RUN_PATH) -> gr.Blocks:
             inputs=[filter_table, filter_detail_state],
             outputs=[
                 filtered_detail_json,
+                filtered_reference_code_box,
+                filtered_inductor_reference_code_box,
                 filtered_conversation_box,
                 filtered_kernel_box,
                 filtered_response_box,
-                filtered_reference_code_box,
             ],
         )
 
