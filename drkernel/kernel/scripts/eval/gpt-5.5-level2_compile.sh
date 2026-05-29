@@ -13,7 +13,7 @@
 # path (BACKEND=openai) since the KernelGYM framework supports it natively,
 # including multi-turn rollout and thinking-mode token handling.
 #
-# Output is saved to /mnt/hstorage/GKG/datasets/distill/ for distillation.
+# Output is written under the local eval script directory.
 # =============================================================================
 
 # --- Proxy fix: OpenAI SDK crashes with SOCKS proxy ---
@@ -23,15 +23,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/grading_common.sh"
 
 PROJECT_NAME="kernel-grading"
-RUN_NAME="gpt-5.5-weelinking"
+RUN_NAME="gpt-5.5-weelinking_0526"
 EXPERIMENT_NAME=${RUN_NAME}
 
 REFERENCE_BACKEND="torch_compile"
 
-HDFS_RUNS_PATH="/mnt/hstorage/GKG/datasets/distill"
+HDFS_RUNS_PATH="/home/chen/NVS/KernelGYM_LC/drkernel/kernel/scripts/eval"
 # Use 10-row subset for small-scale testing (switch to full dataset for production)
-# EVAL_DATASET="/mnt/hstorage/GKG/datasets/structured_datasets/drkernel/drkernel-validation-data/validation_data_thinking.parquet"
-EVAL_DATASET="/mnt/hstorage/GKG/datasets/structured_datasets/drkernel/drkernel-validation-data/validation_data_thinking_matmul_precision_mini10.parquet"
+# EVAL_DATASET="/home/chen/NVS/KernelGYM_LC/data/drkernel-validation-data/validation_data_thinking_matmul_precision_mini10.parquet"
+# EVAL_DATASET="/home/chen/NVS/KernelGYM_LC/data/drkernel-validation-data/validation_data_thinking_matmul_precision.parquet"
+EVAL_DATASET="/home/chen/NVS/KernelGYM_LC/data/drkernel-validation-data/validation_data_thinking_matmul_precision_mini10.parquet"
 
 MULTI_TURN=True
 MAX_USER_TURNS=3
@@ -49,11 +50,11 @@ METRICS_OUTPUT_PATH="${OUTPUT_DIR}/metrics.json"
 RAW_RESPONSE_PATH="${OUTPUT_DIR}/raw_responses.jsonl"
 
 # --- Model path (only the tokenizer is loaded — not used for inference) ---
-ORIGINAL_MODEL="/mnt/hstorage/GKG/pretrained_models/drkernel-8b"
+ORIGINAL_MODEL="${DRKERNEL_MODEL_PATH:-/home/chen/models/drkernel-8b}"
 ACTOR_PATH="${ORIGINAL_MODEL}"
 HF_MODEL_PATH="${ORIGINAL_MODEL}"
-MODEL_NAME="${HF_MODEL_PATH}"
-MODEL_PATH="${MODEL_NAME}"
+MODEL_NAME="$(basename "$HF_MODEL_PATH")"
+MODEL_PATH="${HF_MODEL_PATH}"
 
 # --- Generation Parameters ---
 # For small-scale test: N_SAMPLES=1; for production: N_SAMPLES=8
@@ -77,6 +78,9 @@ PASS_AT_K=1
 # =============================================================================
 # weelinking API Configuration
 # =============================================================================
+# Uses OpenAI-compatible endpoint (/v1/chat/completions).
+# Set ANTHROPIC_AUTH_TOKEN in your environment before running this script.
+# =============================================================================
 BACKEND="openai"
 OPENAI_MODEL="gpt-5.5"
 
@@ -92,12 +96,13 @@ OPENAI_BASE_URL="https://api.weelinking.com/v1"
 OPENAI_TIMEOUT=400
 OPENAI_MAX_RETRIES=5
 OPENAI_MAX_CONCURRENCY=2
+OPENAI_STREAM=True
 OPENAI_THINKING_MODE=False
 
 # =============================================================================
 # Sandbox / Reward Configuration
 # =============================================================================
-REWARD_SERVER_URL="${REWARD_SERVER_URL:-${KERNELGYM_SERVER_URL:-"http://192.168.31.68:8002"}}"
+REWARD_SERVER_URL="${REWARD_SERVER_URL:-${KERNELGYM_SERVER_URL:-"http://172.19.0.1:8002"}}"
 
 REWARD_MANAGER="kernel_async"
 REWARD_FUNC_NAME="calculate_reward_speedup"
@@ -107,7 +112,7 @@ REWARD_WEIGHTS="0.3_0.4_0.3"
 
 REWARD_ENHANCED=True
 REWARD_USE_SANDBOX_RATE_LIMIT=True
-REWARD_RATE_LIMIT=643
+REWARD_RATE_LIMIT=64
 REWARD_ACQUIRE_TIMEOUT=2400
 REWARD_MAX_CONCURRENT=64
 REWARD_TIMEOUT=1800
@@ -119,7 +124,7 @@ NUM_CORRECT_TRIALS=5
 SPEEDUP_REWARD_UPPER_BOUND=3.0
 
 # Custom Reward Function
-CUSTOM_REWARD_PATH="/mnt/hstorage/GKG/framework/KernelGYM/drkernel/kernel/rewards/kernel_reward.py"
+CUSTOM_REWARD_PATH="/home/chen/NVS/KernelGYM_LC/drkernel/kernel/rewards/kernel_reward.py"
 CUSTOM_REWARD_NAME="compute_kernel_reward_batch"
 
 NNODES=1
@@ -152,6 +157,7 @@ export ROLLOUT_GPU_MEMORY_UTIL
 export ROLLOUT_TENSOR_MODEL_PARALLEL_SIZE
 
 export OPENAI_API_KEY
+export OPENAI_STREAM
 export OPENAI_THINKING_MODE
 
 export SOLVE_THRESHOLD

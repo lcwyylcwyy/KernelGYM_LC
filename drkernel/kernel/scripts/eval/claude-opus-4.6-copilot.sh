@@ -93,6 +93,7 @@ OPENAI_TIMEOUT=180
 OPENAI_MAX_RETRIES=5
 # Conservative concurrency for free Copilot plan
 OPENAI_MAX_CONCURRENCY=5
+OPENAI_STREAM=False
 
 # Required headers for GitHub Copilot API
 OPENAI_EXTRA_HEADERS="{User-Agent: opencode/0.1, Openai-Intent: conversation-edits, x-initiator: user}"

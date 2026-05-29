@@ -23,15 +23,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/grading_common.sh"
 
 PROJECT_NAME="kernel-grading"
-RUN_NAME="claude-sonnet-4.6-thinking-weelinking"
+RUN_NAME="claude-sonnet-4.6-thinking-weelinking_0525"
 EXPERIMENT_NAME=${RUN_NAME}
 
 REFERENCE_BACKEND="torch_compile"
 
-HDFS_RUNS_PATH="/mnt/hstorage/GKG/datasets/distill"
+HDFS_RUNS_PATH="/home/chen/NVS/KernelGYM_LC/drkernel/kernel/scripts/eval"
 # Use 10-row subset for small-scale testing (switch to full dataset for production)
-# EVAL_DATASET="/mnt/hstorage/GKG/datasets/structured_datasets/drkernel/drkernel-validation-data/validation_data_thinking.parquet"
-EVAL_DATASET="/mnt/hstorage/GKG/datasets/structured_datasets/drkernel/drkernel-validation-data/validation_data_thinking_matmul_precision_mini10.parquet"
+EVAL_DATASET="/home/chen/NVS/KernelGYM_LC/data/drkernel-validation-data/validation_data_thinking_matmul_precision.parquet"
+# EVAL_DATASET="/home/chen/NVS/KernelGYM_LC/data/drkernel-validation-data/validation_data_thinking_matmul_precision_mini10.parquet"
+# EVAL_DATASET="/home/chen/NVS/KernelGYM_LC/data/drkernel-validation-data/validation_data_thinking_matmul_precision.parquet"
 
 MULTI_TURN=True
 MAX_USER_TURNS=3
@@ -49,11 +50,11 @@ METRICS_OUTPUT_PATH="${OUTPUT_DIR}/metrics.json"
 RAW_RESPONSE_PATH="${OUTPUT_DIR}/raw_responses.jsonl"
 
 # --- Model path (only the tokenizer is loaded — not used for inference) ---
-ORIGINAL_MODEL="/mnt/hstorage/GKG/pretrained_models/drkernel-8b"
+ORIGINAL_MODEL="${DRKERNEL_MODEL_PATH:-/home/chen/models/drkernel-8b}"
 ACTOR_PATH="${ORIGINAL_MODEL}"
 HF_MODEL_PATH="${ORIGINAL_MODEL}"
-MODEL_NAME="${HF_MODEL_PATH}"
-MODEL_PATH="${MODEL_NAME}"
+MODEL_NAME="$(basename "$HF_MODEL_PATH")"
+MODEL_PATH="${HF_MODEL_PATH}"
 
 # --- Generation Parameters ---
 # For small-scale test: N_SAMPLES=1; for production: N_SAMPLES=8
@@ -96,6 +97,7 @@ OPENAI_BASE_URL="https://api.weelinking.com/v1"
 OPENAI_TIMEOUT=360
 OPENAI_MAX_RETRIES=5
 OPENAI_MAX_CONCURRENCY=8
+OPENAI_STREAM=False
 
 # Enable Extended Thinking — the framework passes this as
 # actor_rollout_ref.rollout.openai.thinking_mode=True to the OpenAI engine.
@@ -104,7 +106,7 @@ OPENAI_THINKING_MODE=True
 # =============================================================================
 # Sandbox / Reward Configuration
 # =============================================================================
-REWARD_SERVER_URL="${REWARD_SERVER_URL:-${KERNELGYM_SERVER_URL:-"http://192.168.31.68:8002"}}"
+REWARD_SERVER_URL="${REWARD_SERVER_URL:-${KERNELGYM_SERVER_URL:-"http://172.19.0.1:8002"}}"
 
 REWARD_MANAGER="kernel_async"
 REWARD_FUNC_NAME="calculate_reward_speedup"
@@ -126,7 +128,7 @@ NUM_CORRECT_TRIALS=5
 SPEEDUP_REWARD_UPPER_BOUND=3.0
 
 # Custom Reward Function
-CUSTOM_REWARD_PATH="/mnt/hstorage/GKG/framework/KernelGYM/drkernel/kernel/rewards/kernel_reward.py"
+CUSTOM_REWARD_PATH="/home/chen/NVS/KernelGYM_LC/drkernel/kernel/rewards/kernel_reward.py"
 CUSTOM_REWARD_NAME="compute_kernel_reward_batch"
 
 NNODES=1

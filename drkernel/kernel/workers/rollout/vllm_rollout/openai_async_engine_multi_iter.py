@@ -399,6 +399,11 @@ def _resolve_openai_settings(config: DictConfig) -> dict[str, Any]:
         or os.getenv("OPENAI_USE_RESPONSES_API"),
         default=False,
     )
+    stream = _coerce_bool(
+        openai_cfg.get("stream")
+        or os.getenv("OPENAI_STREAM"),
+        default=False,
+    )
 
     extra_headers = openai_cfg.get("extra_headers") or {}
     from collections.abc import Mapping
@@ -426,6 +431,7 @@ def _resolve_openai_settings(config: DictConfig) -> dict[str, Any]:
         "thinking_mode": thinking_mode,
         "reasoning_effort": reasoning_effort,
         "use_responses_api": use_responses_api,
+        "stream": stream,
         "extra_headers": extra_headers,
     }
 
@@ -556,6 +562,98 @@ def _normalize_responses_api_result(response: Any) -> Any:
         finish_reason = "length" if reason in ("max_output_tokens", "max_tokens") else str(reason)
     elif dumped.get("status") and dumped.get("status") != "completed":
         finish_reason = str(dumped.get("status"))
+
+    message_extra = {}
+    completion_extra = {}
+    if reasoning_text:
+        message_extra["reasoning_content"] = reasoning_text
+        completion_extra["reasoning_content"] = reasoning_text
+
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content=output_text, model_extra=message_extra),
+                finish_reason=finish_reason,
+                model_extra={},
+            )
+        ],
+        model_extra=completion_extra,
+    )
+
+
+def _extract_reasoning_text_from_delta(delta: Any) -> str | None:
+    if delta is None:
+        return None
+
+    if isinstance(delta, dict):
+        for key in ("reasoning_content", "reasoning_details", "reasoning", "thinking"):
+            reasoning = delta.get(key)
+            if reasoning:
+                return _stringify_reasoning(reasoning)
+    else:
+        for key in ("reasoning_content", "reasoning_details", "reasoning", "thinking"):
+            reasoning = getattr(delta, key, None)
+            if reasoning:
+                return _stringify_reasoning(reasoning)
+
+    delta_extra = getattr(delta, "model_extra", None) or {}
+    if delta_extra:
+        for key in ("reasoning_content", "reasoning_details", "reasoning", "thinking"):
+            reasoning = delta_extra.get(key)
+            if reasoning:
+                return _stringify_reasoning(reasoning)
+
+    return None
+
+
+def _collect_stream_content_parts(content: Any) -> list[str]:
+    if content is None:
+        return []
+    if isinstance(content, str):
+        return [content]
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+            else:
+                text = getattr(item, "text", None) or getattr(item, "content", None)
+            if isinstance(text, str):
+                parts.append(text)
+        return parts
+    return [str(content)]
+
+
+async def _normalize_chat_completion_stream(stream: Any) -> Any:
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    finish_reason = "stop"
+
+    async for chunk in stream:
+        choices = getattr(chunk, "choices", None) or []
+        if not choices:
+            continue
+        choice = choices[0]
+        choice_finish_reason = getattr(choice, "finish_reason", None)
+        if choice_finish_reason:
+            finish_reason = choice_finish_reason
+
+        delta = getattr(choice, "delta", None)
+        if delta is None and isinstance(choice, dict):
+            delta = choice.get("delta")
+
+        content = delta.get("content") if isinstance(delta, dict) else getattr(delta, "content", None)
+        content_parts.extend(_collect_stream_content_parts(content))
+
+        reasoning_text = _extract_reasoning_text_from_delta(delta)
+        if reasoning_text:
+            reasoning_parts.append(reasoning_text)
+
+    output_text = "".join([part for part in content_parts if part])
+    reasoning_text = "".join([part for part in reasoning_parts if part])
 
     message_extra = {}
     completion_extra = {}
@@ -767,6 +865,7 @@ class AsyncvLLMEngine:
         self.client: AsyncOpenAI | None = None
         self.openai_model: str | None = None
         self.use_responses_api = False
+        self.openai_stream = False
         self._openai_semaphore: asyncio.Semaphore | None = None
         self.thinking_mode = False
         self.reasoning_effort = None
@@ -789,6 +888,7 @@ class AsyncvLLMEngine:
         self.openai_model = settings["model"]
         self.openai_timeout = settings["timeout"]  # Store for per-request HTTP timeout
         self.use_responses_api = settings.get("use_responses_api", False)
+        self.openai_stream = settings.get("stream", False)
         self._openai_semaphore = asyncio.Semaphore(settings["max_concurrency"])
         self.thinking_mode = settings["thinking_mode"]
         self.reasoning_effort = settings.get("reasoning_effort")
@@ -870,6 +970,10 @@ class AsyncvLLMEngine:
             http_timeout = getattr(self, "openai_timeout", None) or timeout
             if http_timeout is not None:
                 payload["timeout"] = http_timeout
+            if self.openai_stream:
+                payload["stream"] = True
+                stream = await self.client.chat.completions.create(**payload)
+                return await _normalize_chat_completion_stream(stream)
             return await self.client.chat.completions.create(**payload)
 
     async def wake_up(self):
@@ -1392,6 +1496,7 @@ class MultiIterAsyncvLLMEngine:
         self.client: AsyncOpenAI | None = None
         self.openai_model: str | None = None
         self.use_responses_api = False
+        self.openai_stream = False
         self._openai_semaphore: asyncio.Semaphore | None = None
         self.thinking_mode = False
         self.reasoning_effort = None
@@ -1685,6 +1790,7 @@ class MultiIterAsyncvLLMEngine:
         self.openai_model = settings["model"]
         self.openai_timeout = settings["timeout"]  # Store for per-request HTTP timeout
         self.use_responses_api = settings.get("use_responses_api", False)
+        self.openai_stream = settings.get("stream", False)
         self._openai_semaphore = asyncio.Semaphore(settings["max_concurrency"])
         self.thinking_mode = settings["thinking_mode"]
         self.reasoning_effort = settings.get("reasoning_effort")
@@ -1777,6 +1883,10 @@ class MultiIterAsyncvLLMEngine:
             http_timeout = getattr(self, 'openai_timeout', None) or timeout
             if http_timeout is not None:
                 payload["timeout"] = http_timeout
+            if self.openai_stream:
+                payload["stream"] = True
+                stream = await self.client.chat.completions.create(**payload)
+                return await _normalize_chat_completion_stream(stream)
             return await self.client.chat.completions.create(**payload)
 
     def _resolve_multi_turn_rewards(self, turn_rewards: list[float], turn_speedups: list[float], turn_correctness: list[bool]) -> list[float]:
