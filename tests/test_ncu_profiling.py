@@ -1,8 +1,5 @@
 from kernelgym.server.api.models import EvaluationRequest
-from kernelgym.toolkit.kernelbench.profiling import (
-    DEFAULT_NCU_METRICS,
-    parse_ncu_csv,
-)
+from kernelgym.toolkit.kernelbench.profiling import DEFAULT_NCU_METRICS, parse_ncu_csv
 
 
 def test_evaluation_request_accepts_ncu_profiling_fields():
@@ -21,7 +18,7 @@ def test_evaluation_request_accepts_ncu_profiling_fields():
 def test_parse_ncu_csv_builds_metric_payload_and_scalar_aliases():
     csv_text = "\n".join(
         [
-            '==PROF== Connected to process 123',
+            "==PROF== Connected to process 123",
             '"ID","Process ID","Process Name","Host Name","Kernel Name","Context","Stream","Section Name","Metric Name","Metric Unit","Metric Value"',
             '"1","123","python","host","kernel_a","1","7","NCU","sm__inst_executed_pipe_fma.sum","inst","1,024"',
             '"1","123","python","host","kernel_b","1","7","NCU","sm__inst_executed_pipe_fma.sum","inst","512"',
@@ -44,7 +41,9 @@ def test_parse_ncu_csv_builds_metric_payload_and_scalar_aliases():
     assert parsed["scalars"]["ncu_sm_inst_executed_sum"] == 6144.0
     assert parsed["scalars"]["ncu_l1tex_t_sector_hit_rate_pct"] == 87.5
     assert parsed["scalars"]["ncu_fma_instruction_ratio"] == 0.25
-    assert round(parsed["scalars"]["ncu_active_elapsed_cycle_ratio"], 6) == round(60.0 / 110.0, 6)
+    assert round(parsed["scalars"]["ncu_active_elapsed_cycle_ratio"], 6) == round(
+        60.0 / 110.0, 6
+    )
 
 
 def test_parse_ncu_raw_page_wide_csv():

@@ -17,7 +17,6 @@ from uuid import uuid4
 import httpx
 import pandas as pd
 
-
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATASET = (
     ROOT
@@ -60,7 +59,9 @@ def extract_python_code(text: str) -> str:
     if "class ModelNew" in text:
         return text.strip()
 
-    raise ValueError("Codex response did not contain a Python block with class ModelNew")
+    raise ValueError(
+        "Codex response did not contain a Python block with class ModelNew"
+    )
 
 
 def json_safe(value: Any) -> Any:
@@ -136,10 +137,14 @@ def score_from_eval(eval_result: dict[str, Any]) -> float:
 
 def drkernel_turn_metrics(eval_result: dict[str, Any]) -> dict[str, str]:
     metadata = eval_result.get("metadata") or {}
-    compiled = _first_present(eval_result.get("compiled"), eval_result.get("compilation"))
+    compiled = _first_present(
+        eval_result.get("compiled"), eval_result.get("compilation")
+    )
     correctness = eval_result.get("correctness")
     speedup = _as_float(eval_result.get("speedup"))
-    decoy = _first_present(eval_result.get("decoy_kernel"), eval_result.get("is_decoy_kernel"))
+    decoy = _first_present(
+        eval_result.get("decoy_kernel"), eval_result.get("is_decoy_kernel")
+    )
     custom_time = _as_float(
         _first_present(
             eval_result.get("custom_kernel_cuda_time_in_profiling_us"),
@@ -262,7 +267,9 @@ class ResultStore:
         self.results_json = output_dir / "results.json"
         self.summary_json = output_dir / "summary.json"
         self.raw_responses_jsonl = output_dir / "raw_responses.jsonl"
-        self.graded_conversations_jsonl = output_dir / "graded_results_conversations_conversations.jsonl"
+        self.graded_conversations_jsonl = (
+            output_dir / "graded_results_conversations_conversations.jsonl"
+        )
         self.metrics_json = output_dir / "metrics.json"
         self.graded_results_parquet = output_dir / "graded_results.parquet"
         self._lock = threading.Lock()
@@ -299,7 +306,10 @@ class ResultStore:
             self._rows_by_key[key] = row
             rows = sorted(
                 self._rows_by_key.values(),
-                key=lambda r: (int(r.get("problem_id", -1)), int(r.get("sample_id", -1))),
+                key=lambda r: (
+                    int(r.get("problem_id", -1)),
+                    int(r.get("sample_id", -1)),
+                ),
             )
             self.results_jsonl.write_text(
                 "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows),
@@ -332,9 +342,13 @@ class ResultStore:
                     "output": row.get("raw_response") or "",
                 }
             )
-            conversation = drkernel_conversation_row(item, row, global_turn_idx=turn_idx)
+            conversation = drkernel_conversation_row(
+                item, row, global_turn_idx=turn_idx
+            )
             conversation_lines.append(conversation)
-            per_turn_scores = [float(turn.get("score") or 0.0) for turn in row.get("turns") or []]
+            per_turn_scores = [
+                float(turn.get("score") or 0.0) for turn in row.get("turns") or []
+            ]
             parquet_rows.append(
                 {
                     "uid": uid,
@@ -342,12 +356,16 @@ class ResultStore:
                     "sample_id": item.sample_id,
                     "score": row.get("score"),
                     "num_turns": row.get("num_turns"),
-                    "per_turn_scores_json": json.dumps(per_turn_scores, ensure_ascii=False),
+                    "per_turn_scores_json": json.dumps(
+                        per_turn_scores, ensure_ascii=False
+                    ),
                     "compiled": row.get("compiled"),
                     "correctness": row.get("correctness"),
                     "speedup": row.get("speedup"),
                     "turns_json": json.dumps(conversation["turns"], ensure_ascii=False),
-                    "metrics_json": json.dumps(row.get("metrics") or {}, ensure_ascii=False),
+                    "metrics_json": json.dumps(
+                        row.get("metrics") or {}, ensure_ascii=False
+                    ),
                 }
             )
 
@@ -356,15 +374,21 @@ class ResultStore:
             encoding="utf-8",
         )
         self.graded_conversations_jsonl.write_text(
-            "".join(json.dumps(line, ensure_ascii=False) + "\n" for line in conversation_lines),
+            "".join(
+                json.dumps(line, ensure_ascii=False) + "\n"
+                for line in conversation_lines
+            ),
             encoding="utf-8",
         )
         self.metrics_json.write_text(
-            json.dumps(drkernel_metrics_json(rows), ensure_ascii=False, indent=2) + "\n",
+            json.dumps(drkernel_metrics_json(rows), ensure_ascii=False, indent=2)
+            + "\n",
             encoding="utf-8",
         )
         try:
-            pd.DataFrame(parquet_rows).to_parquet(self.graded_results_parquet, index=False)
+            pd.DataFrame(parquet_rows).to_parquet(
+                self.graded_results_parquet, index=False
+            )
         except Exception as exc:
             (self.output_dir / "graded_results.parquet.error.txt").write_text(
                 repr(exc) + "\n",
@@ -407,7 +431,9 @@ def drkernel_metrics_json(rows: list[dict[str, Any]]) -> dict[str, Any]:
     compiled = [r.get("compiled") is True for r in evaluated]
     correct = [r.get("correctness") is True for r in evaluated]
     speedup_ge_1 = [
-        r.get("correctness") is True and _as_float(r.get("speedup")) is not None and float(r["speedup"]) >= 1.0
+        r.get("correctness") is True
+        and _as_float(r.get("speedup")) is not None
+        and float(r["speedup"]) >= 1.0
         for r in evaluated
     ]
     mean_score = (sum(scores) / len(scores)) if scores else None
@@ -416,14 +442,16 @@ def drkernel_metrics_json(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "val/test_score/kernelbench_level2_validation_pass@1": _rate(speedup_ge_1),
         "val/test_score_extra/kernelbench_level2_validation/mean_score": mean_score,
         "val/multiturn/num_turns/mean": (
-            sum(int(r.get("num_turns") or 1) for r in evaluated) / len(evaluated)
-        )
-        if evaluated
-        else None,
+            (sum(int(r.get("num_turns") or 1) for r in evaluated) / len(evaluated))
+            if evaluated
+            else None
+        ),
         "val/kernel/turn_1/compilation_rate": _rate(compiled),
         "val/kernel/turn_1/correctness_rate": _rate(correct),
         "val/kernel/turn_1/speedup_ge_1_rate": _rate(speedup_ge_1),
-        "val/kernel/turn_1/mean_correct_speedup": (sum(speedups) / len(speedups)) if speedups else None,
+        "val/kernel/turn_1/mean_correct_speedup": (
+            (sum(speedups) / len(speedups)) if speedups else None
+        ),
         "val/kernel/turn_1/best_speedup": max(speedups) if speedups else None,
         "num_rows": len(rows),
         "num_evaluated": len(evaluated),
@@ -451,11 +479,15 @@ def drkernel_metrics_json(rows: list[dict[str, Any]]) -> dict[str, Any]:
         ]
         metrics[f"val/kernel/turn_{turn_id}/compilation_rate"] = _rate(turn_compiled)
         metrics[f"val/kernel/turn_{turn_id}/correctness_rate"] = _rate(turn_correct)
-        metrics[f"val/kernel/turn_{turn_id}/speedup_ge_1_rate"] = _rate(turn_speedup_ge_1)
+        metrics[f"val/kernel/turn_{turn_id}/speedup_ge_1_rate"] = _rate(
+            turn_speedup_ge_1
+        )
         metrics[f"val/kernel/turn_{turn_id}/mean_correct_speedup"] = (
-            sum(turn_speedups) / len(turn_speedups)
-        ) if turn_speedups else None
-        metrics[f"val/kernel/turn_{turn_id}/best_speedup"] = max(turn_speedups) if turn_speedups else None
+            (sum(turn_speedups) / len(turn_speedups)) if turn_speedups else None
+        )
+        metrics[f"val/kernel/turn_{turn_id}/best_speedup"] = (
+            max(turn_speedups) if turn_speedups else None
+        )
     return metrics
 
 
@@ -560,8 +592,12 @@ def run_codex(
     )
     elapsed = time.monotonic() - start
     if completed.returncode != 0:
-        raise RuntimeError(f"codex exec failed with rc={completed.returncode}: {completed.stderr[-1000:]}")
-    raw_text = raw_path.read_text(encoding="utf-8") if raw_path.exists() else completed.stdout
+        raise RuntimeError(
+            f"codex exec failed with rc={completed.returncode}: {completed.stderr[-1000:]}"
+        )
+    raw_text = (
+        raw_path.read_text(encoding="utf-8") if raw_path.exists() else completed.stdout
+    )
     code = extract_python_code(raw_text)
     kernel_path.write_text(code + "\n", encoding="utf-8")
     meta = {
@@ -617,7 +653,11 @@ def write_eval_artifacts(
     turns: list[dict[str, Any]],
     total_score: float,
 ) -> dict[str, Path]:
-    eval_dir = output_dir / "eval_outputs" / f"problem_{item.problem_id}_sample_{item.sample_id}"
+    eval_dir = (
+        output_dir
+        / "eval_outputs"
+        / f"problem_{item.problem_id}_sample_{item.sample_id}"
+    )
     eval_dir.mkdir(parents=True, exist_ok=True)
     paths = {
         "eval_output_dir": eval_dir,
@@ -625,25 +665,33 @@ def write_eval_artifacts(
         "conversation_path": eval_dir / "full_conversation.txt",
         "summary_path": eval_dir / "summary.json",
     }
-    paths["reference_path"].write_text(item.reference_code.rstrip() + "\n", encoding="utf-8")
+    paths["reference_path"].write_text(
+        item.reference_code.rstrip() + "\n", encoding="utf-8"
+    )
     for turn in turns:
         turn_id = int(turn["turn_id"])
         kernel_path = eval_dir / f"turn_{turn_id}_kernel.py"
         eval_path = eval_dir / f"turn_{turn_id}_eval.json"
         state_path = eval_dir / f"turn_{turn_id}_state.json"
-        kernel_path.write_text(str(turn["kernel_code"]).rstrip() + "\n", encoding="utf-8")
+        kernel_path.write_text(
+            str(turn["kernel_code"]).rstrip() + "\n", encoding="utf-8"
+        )
         eval_path.write_text(
-            json.dumps(json_safe(turn["eval_result"]), ensure_ascii=False, indent=2) + "\n",
+            json.dumps(json_safe(turn["eval_result"]), ensure_ascii=False, indent=2)
+            + "\n",
             encoding="utf-8",
         )
         state_path.write_text(
-            json.dumps(json_safe(turn.get("state") or {}), ensure_ascii=False, indent=2) + "\n",
+            json.dumps(json_safe(turn.get("state") or {}), ensure_ascii=False, indent=2)
+            + "\n",
             encoding="utf-8",
         )
         paths[f"turn_{turn_id}_kernel_path"] = kernel_path
         paths[f"turn_{turn_id}_eval_path"] = eval_path
         paths[f"turn_{turn_id}_state_path"] = state_path
-    paths["conversation_path"].write_text(conversation_text(item, turns), encoding="utf-8")
+    paths["conversation_path"].write_text(
+        conversation_text(item, turns), encoding="utf-8"
+    )
     per_turn_scores = [float(turn.get("score") or 0.0) for turn in turns]
     first_score = per_turn_scores[0] if per_turn_scores else 0.0
     last_score = per_turn_scores[-1] if per_turn_scores else 0.0
@@ -673,7 +721,9 @@ def write_eval_artifacts(
     return paths
 
 
-def load_items(dataset: Path, sample_id: int, limit: int | None, problem_ids: set[int] | None) -> list[WorkItem]:
+def load_items(
+    dataset: Path, sample_id: int, limit: int | None, problem_ids: set[int] | None
+) -> list[WorkItem]:
     df = pd.read_parquet(dataset)
     items: list[WorkItem] = []
     for row_index, row in df.iterrows():
@@ -721,7 +771,9 @@ def process_one(
                 total_turns=args.num_turns,
             )
             turn_kernel_path = output_dir / "kernels" / f"{item.key}_turn_{turn_id}.py"
-            turn_raw_path = output_dir / "raw_responses" / f"{item.key}_turn_{turn_id}.md"
+            turn_raw_path = (
+                output_dir / "raw_responses" / f"{item.key}_turn_{turn_id}.md"
+            )
             turn_codex_meta: dict[str, Any] = {}
             if args.resume and turn_kernel_path.exists() and turn_raw_path.exists():
                 kernel_code = turn_kernel_path.read_text(encoding="utf-8")
@@ -737,7 +789,12 @@ def process_one(
                     prompt=prompt,
                 )
                 raw_text = str(turn_codex_meta.get("raw_response") or "")
-            codex_meta.update({f"turn_{turn_id}_{key}": value for key, value in turn_codex_meta.items()})
+            codex_meta.update(
+                {
+                    f"turn_{turn_id}_{key}": value
+                    for key, value in turn_codex_meta.items()
+                }
+            )
             with eval_semaphore:
                 eval_result = evaluate_kernel(
                     item,
@@ -845,16 +902,29 @@ def parse_problem_ids(value: str | None) -> set[int] | None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run Codex GPT-5.5 on KernelBench validation parquet.")
+    parser = argparse.ArgumentParser(
+        description="Run Codex GPT-5.5 on KernelBench validation parquet."
+    )
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
-    parser.add_argument("--server-url", default=os.getenv("KERNELGYM_SERVER_URL") or os.getenv("KERNELOGYM_SERVER_URL") or DEFAULT_SERVER_URL)
+    parser.add_argument(
+        "--server-url",
+        default=os.getenv("KERNELGYM_SERVER_URL")
+        or os.getenv("KERNELOGYM_SERVER_URL")
+        or DEFAULT_SERVER_URL,
+    )
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--model", default="gpt-5.5")
-    parser.add_argument("--reasoning-effort", choices=["low", "medium", "high", "xhigh"], default="xhigh")
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=["low", "medium", "high", "xhigh"],
+        default="xhigh",
+    )
     parser.add_argument("--sample-id", type=int, default=0)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--problem-ids", default=None)
-    parser.add_argument("--max-codex-workers", type=int, default=2, choices=[1, 2, 3, 4])
+    parser.add_argument(
+        "--max-codex-workers", type=int, default=2, choices=[1, 2, 3, 4]
+    )
     parser.add_argument("--max-eval-workers", type=int, default=1, choices=[1, 2, 3, 4])
     parser.add_argument("--num-turns", type=int, default=3, choices=[1, 2, 3])
     parser.add_argument("--codex-timeout", type=int, default=1800)
@@ -873,7 +943,11 @@ def main() -> None:
     if output_dir is None:
         output_dir = default_output_dir(dataset, args.model)
     output_dir.mkdir(parents=True, exist_ok=True)
-    grading_dir = output_dir if output_dir.name == "grading_results" else output_dir / "grading_results"
+    grading_dir = (
+        output_dir
+        if output_dir.name == "grading_results"
+        else output_dir / "grading_results"
+    )
     grading_dir.mkdir(parents=True, exist_ok=True)
 
     manifest = {

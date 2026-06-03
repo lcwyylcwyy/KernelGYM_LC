@@ -46,7 +46,10 @@ class ModelNew:
 ```
 """
 
-    assert extract_python_code(text) == "import torch\n\nclass ModelNew:\n    improved = True"
+    assert (
+        extract_python_code(text)
+        == "import torch\n\nclass ModelNew:\n    improved = True"
+    )
 
 
 def test_prompt_text_from_numpy_prompt_cell():
@@ -128,9 +131,24 @@ def test_drkernel_conversation_row_uses_three_turn_schema():
         "key": item.key,
         "score": 1.5,
         "turns": [
-            {"turn_id": 1, "raw_response": "one", "score": 0.5, "metrics": {"speedup": "0.5"}},
-            {"turn_id": 2, "raw_response": "two", "score": 1.0, "metrics": {"speedup": "1"}},
-            {"turn_id": 3, "raw_response": "three", "score": 1.5, "metrics": {"speedup": "1.5"}},
+            {
+                "turn_id": 1,
+                "raw_response": "one",
+                "score": 0.5,
+                "metrics": {"speedup": "0.5"},
+            },
+            {
+                "turn_id": 2,
+                "raw_response": "two",
+                "score": 1.0,
+                "metrics": {"speedup": "1"},
+            },
+            {
+                "turn_id": 3,
+                "raw_response": "three",
+                "score": 1.5,
+                "metrics": {"speedup": "1.5"},
+            },
         ],
     }
 
@@ -158,7 +176,12 @@ def test_build_codex_prompt_later_turn_includes_eval_feedback():
         turn_id=2,
         previous_turn={
             "kernel_code": "class ModelNew:\n    pass",
-            "eval_result": {"compiled": True, "correctness": False, "speedup": 0.0, "error_message": "bad"},
+            "eval_result": {
+                "compiled": True,
+                "correctness": False,
+                "speedup": 0.0,
+                "error_message": "bad",
+            },
         },
     )
 
@@ -170,7 +193,15 @@ def test_build_codex_prompt_later_turn_includes_eval_feedback():
 
 def test_result_store_resume_requires_requested_turn_count(tmp_path):
     store = ResultStore(tmp_path)
-    store.write({"key": "p1_s0", "stage": "evaluated", "problem_id": 1, "sample_id": 0, "num_turns": 1})
+    store.write(
+        {
+            "key": "p1_s0",
+            "stage": "evaluated",
+            "problem_id": 1,
+            "sample_id": 0,
+            "num_turns": 1,
+        }
+    )
 
     assert store.has_completed("p1_s0", requested_turns=1)
     assert not store.has_completed("p1_s0", requested_turns=3)
