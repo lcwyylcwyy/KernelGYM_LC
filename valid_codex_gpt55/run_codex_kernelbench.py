@@ -28,6 +28,10 @@ DEFAULT_EVAL_ROOT = ROOT / "drkernel/kernel/scripts/eval"
 
 CODE_FENCE_RE = re.compile(r"```(?:\w+)?\s*\n?(?P<code>.*?)```", re.S)
 ROLE_PREFIX_RE = re.compile(r"^(?:user|assistant|system)\n", re.I)
+VISIBLE_NOTES_INSTRUCTION = """
+
+Before the Python code block, include a concise visible section exactly titled `Optimization notes:` with 3-6 bullets covering the optimization strategy, expected bottleneck, and any tradeoffs. Do not include hidden chain-of-thought; keep this as a short user-facing engineering summary.
+"""
 
 
 def strip_legacy_role_prefix(text: str) -> str:
@@ -62,6 +66,25 @@ def extract_python_code(text: str) -> str:
     raise ValueError(
         "Codex response did not contain a Python block with class ModelNew"
     )
+
+
+def extract_optimization_notes(text: str) -> str:
+    before_code = text.split("```", 1)[0].strip()
+    if not before_code:
+        return (
+            "Optimization notes:\n"
+            "- No visible optimization notes were found before the code block."
+        )
+
+    marker = "optimization notes:"
+    marker_idx = before_code.lower().find(marker)
+    if marker_idx >= 0:
+        return before_code[marker_idx:].strip()
+    return "Optimization notes:\n" + before_code
+
+
+def prompt_with_visible_notes_instruction(prompt: str) -> str:
+    return prompt.rstrip() + VISIBLE_NOTES_INSTRUCTION
 
 
 def json_safe(value: Any) -> Any:
@@ -498,7 +521,7 @@ Here is the server feedback. Please refer to this feedback to improve the implem
 Server feedback (status/metrics/errors):
 {json.dumps(json_safe(eval_result), ensure_ascii=False, indent=2)}
 
-Return an improved Triton implementation named `ModelNew` as a single ```python``` block. Let's think step by step.
+Return an improved Triton implementation named `ModelNew` as a single ```python``` block. Before the code block, include a concise visible `Optimization notes:` section. Do not include hidden chain-of-thought.
 """
 
 
@@ -528,7 +551,7 @@ def build_codex_prompt(
     total_turns: int = 1,
 ) -> str:
     if turn_id <= 1:
-        return item.prompt_text.rstrip() + "\n"
+        return prompt_with_visible_notes_instruction(item.prompt_text) + "\n"
 
     turns = list(history or [])
     if not turns and previous_turn:
@@ -536,6 +559,21 @@ def build_codex_prompt(
     if not turns:
         raise ValueError("later turns require previous turn feedback")
     return conversation_text(item, turns)
+
+
+def write_turn_optimization_notes(
+    item: WorkItem,
+    *,
+    output_dir: Path,
+    turn_id: int,
+    raw_response: str,
+) -> tuple[str, Path]:
+    notes_dir = output_dir / "reasoning_summaries"
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    notes = extract_optimization_notes(raw_response)
+    notes_path = notes_dir / f"{item.key}_turn_{turn_id}.txt"
+    notes_path.write_text(notes.rstrip() + "\n", encoding="utf-8")
+    return notes, notes_path
 
 
 def run_codex(
@@ -599,9 +637,17 @@ def run_codex(
         raw_path.read_text(encoding="utf-8") if raw_path.exists() else completed.stdout
     )
     code = extract_python_code(raw_text)
+    optimization_notes, optimization_notes_path = write_turn_optimization_notes(
+        item,
+        output_dir=output_dir,
+        turn_id=turn_id,
+        raw_response=raw_text,
+    )
     kernel_path.write_text(code + "\n", encoding="utf-8")
     meta = {
         "raw_response": raw_text,
+        "optimization_notes": optimization_notes,
+        "optimization_notes_path": optimization_notes_path,
         "turn_id": turn_id,
         "codex_returncode": completed.returncode,
         "codex_elapsed_sec": round(elapsed, 3),
@@ -663,16 +709,25 @@ def write_eval_artifacts(
         "eval_output_dir": eval_dir,
         "reference_path": eval_dir / "reference.py",
         "conversation_path": eval_dir / "full_conversation.txt",
+        "optimization_notes_path": eval_dir / "optimization_notes.txt",
         "summary_path": eval_dir / "summary.json",
     }
     paths["reference_path"].write_text(
         item.reference_code.rstrip() + "\n", encoding="utf-8"
     )
+    notes_dir = output_dir / "reasoning_summaries"
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    notes_sections: list[str] = []
     for turn in turns:
         turn_id = int(turn["turn_id"])
         kernel_path = eval_dir / f"turn_{turn_id}_kernel.py"
         eval_path = eval_dir / f"turn_{turn_id}_eval.json"
         state_path = eval_dir / f"turn_{turn_id}_state.json"
+        turn_notes_path = notes_dir / f"{item.key}_turn_{turn_id}.txt"
+        notes = str(
+            turn.get("optimization_notes")
+            or extract_optimization_notes(str(turn.get("raw_response") or ""))
+        )
         kernel_path.write_text(
             str(turn["kernel_code"]).rstrip() + "\n", encoding="utf-8"
         )
@@ -686,9 +741,16 @@ def write_eval_artifacts(
             + "\n",
             encoding="utf-8",
         )
+        turn_notes_path.write_text(notes.rstrip() + "\n", encoding="utf-8")
+        notes_sections.append(f"[turn {turn_id}]\n{notes.rstrip()}")
         paths[f"turn_{turn_id}_kernel_path"] = kernel_path
         paths[f"turn_{turn_id}_eval_path"] = eval_path
         paths[f"turn_{turn_id}_state_path"] = state_path
+        paths[f"turn_{turn_id}_optimization_notes_path"] = turn_notes_path
+    notes_text = "\n\n".join(notes_sections).rstrip()
+    paths["optimization_notes_path"].write_text(
+        (notes_text + "\n") if notes_text else "", encoding="utf-8"
+    )
     paths["conversation_path"].write_text(
         conversation_text(item, turns), encoding="utf-8"
     )
@@ -778,6 +840,24 @@ def process_one(
             if args.resume and turn_kernel_path.exists() and turn_raw_path.exists():
                 kernel_code = turn_kernel_path.read_text(encoding="utf-8")
                 raw_text = turn_raw_path.read_text(encoding="utf-8")
+                optimization_notes, optimization_notes_path = (
+                    write_turn_optimization_notes(
+                        item,
+                        output_dir=output_dir,
+                        turn_id=turn_id,
+                        raw_response=raw_text,
+                    )
+                )
+                turn_codex_meta.update(
+                    {
+                        "raw_response": raw_text,
+                        "optimization_notes": optimization_notes,
+                        "optimization_notes_path": optimization_notes_path,
+                        "turn_id": turn_id,
+                        "raw_response_path": turn_raw_path,
+                        "kernel_path": turn_kernel_path,
+                    }
+                )
             else:
                 kernel_code, turn_codex_meta = run_codex(
                     item,
@@ -789,6 +869,10 @@ def process_one(
                     prompt=prompt,
                 )
                 raw_text = str(turn_codex_meta.get("raw_response") or "")
+            optimization_notes = str(
+                turn_codex_meta.get("optimization_notes")
+                or extract_optimization_notes(raw_text)
+            )
             codex_meta.update(
                 {
                     f"turn_{turn_id}_{key}": value
@@ -811,6 +895,7 @@ def process_one(
                 "turn_id": turn_id,
                 "prompt": prompt,
                 "raw_response": raw_text,
+                "optimization_notes": optimization_notes,
                 "kernel_code": kernel_code,
                 "score": score,
                 "metrics": metrics,
@@ -856,6 +941,7 @@ def process_one(
             "prompt": item.prompt_text,
             "reference_code": item.reference_code,
             "raw_response": last_turn.get("raw_response"),
+            "optimization_notes": last_turn.get("optimization_notes"),
             "kernel_code": last_turn.get("kernel_code"),
             "score": total_score,
             "last_score": last_turn.get("score"),

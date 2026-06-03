@@ -7,8 +7,10 @@ from valid_codex_gpt55.run_codex_kernelbench import (
     conversation_text,
     drkernel_conversation_row,
     drkernel_turn_metrics,
+    extract_optimization_notes,
     extract_python_code,
     prompt_text_from_cell,
+    write_eval_artifacts,
 )
 
 
@@ -221,3 +223,79 @@ def test_conversation_text_strips_legacy_role_prefix():
 
     assert text.startswith("[user]\noptimize this")
     assert not text.startswith("[user]\nuser\n")
+
+
+def test_extract_optimization_notes_from_response_before_code_block():
+    response = """Optimization notes:
+- Fuse bias and clamp into one Triton kernel.
+- Keep matmul in torch because it is already fast.
+
+```python
+class ModelNew:
+    pass
+```
+"""
+
+    assert extract_optimization_notes(response) == (
+        "Optimization notes:\n"
+        "- Fuse bias and clamp into one Triton kernel.\n"
+        "- Keep matmul in torch because it is already fast."
+    )
+
+
+def test_build_codex_prompt_asks_for_visible_optimization_notes():
+    item = WorkItem(
+        row_index=0,
+        problem_id=8,
+        name="example",
+        prompt_text="optimize this",
+        reference_code="class Model: pass",
+        sample_id=0,
+    )
+
+    prompt = build_codex_prompt(item, turn_id=1)
+
+    assert "Optimization notes:" in prompt
+    assert "Do not include hidden chain-of-thought" in prompt
+
+
+def test_write_eval_artifacts_saves_optimization_notes(tmp_path):
+    item = WorkItem(
+        row_index=0,
+        problem_id=8,
+        name="example",
+        prompt_text="optimize this",
+        reference_code="class Model: pass",
+        sample_id=0,
+    )
+    turns = [
+        {
+            "turn_id": 1,
+            "raw_response": "Optimization notes:\n- First idea.\n\n```python\nclass ModelNew: pass\n```",
+            "optimization_notes": "Optimization notes:\n- First idea.",
+            "kernel_code": "class ModelNew: pass",
+            "eval_result": {"compiled": True, "correctness": True, "speedup": 1.2},
+            "score": 1.2,
+            "state": {},
+        },
+        {
+            "turn_id": 2,
+            "raw_response": "Optimization notes:\n- Second idea.\n\n```python\nclass ModelNew: pass\n```",
+            "optimization_notes": "Optimization notes:\n- Second idea.",
+            "kernel_code": "class ModelNew: pass",
+            "eval_result": {"compiled": True, "correctness": True, "speedup": 1.5},
+            "score": 1.5,
+            "state": {},
+        },
+    ]
+
+    paths = write_eval_artifacts(item, output_dir=tmp_path, turns=turns, total_score=2.7)
+
+    notes_path = paths["optimization_notes_path"]
+    assert notes_path.exists()
+    text = notes_path.read_text()
+    assert "[turn 1]" in text
+    assert "- First idea." in text
+    assert "[turn 2]" in text
+    assert "- Second idea." in text
+    assert (tmp_path / "reasoning_summaries" / "p8_s0_turn_1.txt").exists()

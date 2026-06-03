@@ -14,12 +14,14 @@ import pandas as pd
 import filter as fast_filter
 
 BEST_BY_TURN_PATTERN = re.compile(r"^val/kernel/best_by_turn_(\d+)/")
+TURN_METRIC_PATTERN = re.compile(r"^val/kernel/turn_(\d+)/")
 TURN_EVAL_PATTERN = re.compile(r"^turn_(\d+)_eval\.json$")
-TURN_FAST_PATTERN = re.compile(r"^val/kernel/turn_(\d+)/fast@(1(?:\.0|\.2)?)_in_all$")
-BEST_BY_TURN_FAST_PATTERN = re.compile(r"^val/kernel/best_by_turn_(\d+)/fast@(1(?:\.0|\.2)?)_in_all$")
+TURN_FAST_PATTERN = re.compile(r"^val/kernel/turn_(\d+)/fast@p?(\d+(?:\.\d+)?)_in_all$")
+BEST_BY_TURN_FAST_PATTERN = re.compile(r"^val/kernel/best_by_turn_(\d+)/fast@p?(\d+(?:\.\d+)?)_in_all$")
 DEFAULT_FILTER_THRESHOLD = 1.2
 DEFAULT_FILTER_PREFIX = "best_by_turn"
 NCU_OVERVIEW_PREFIX = "val/test_score_extra/ncu_"
+FAST_THRESHOLDS = (1.0, 1.2, 1.5, 2.0)
 
 
 def get_default_run_path() -> str:
@@ -180,6 +182,69 @@ def _safe_float(value: Any, fallback: float = 0.0) -> float:
         return fallback
 
 
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def read_text_file(path: Path) -> str:
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8", errors="replace").strip()
+
+
+def _turn_speedup(turn_eval: dict[str, Any]) -> float:
+    return _safe_float(_first_present(turn_eval.get("performance"), turn_eval.get("speedup")))
+
+
+def parse_optimization_notes_by_turn(notes_text: str) -> dict[int, str]:
+    notes_by_turn: dict[int, str] = {}
+    current_turn_id: int | None = None
+    current_lines: list[str] = []
+
+    for line in notes_text.splitlines():
+        matched = re.match(r"^\[turn\s+(\d+)\]\s*$", line.strip(), flags=re.I)
+        if matched:
+            if current_turn_id is not None:
+                notes_by_turn[current_turn_id] = "\n".join(current_lines).strip()
+            current_turn_id = int(matched.group(1))
+            current_lines = []
+            continue
+        if current_turn_id is not None:
+            current_lines.append(line)
+
+    if current_turn_id is not None:
+        notes_by_turn[current_turn_id] = "\n".join(current_lines).strip()
+    return notes_by_turn
+
+
+def read_visible_optimization_notes(
+    grading_results_dir: Path,
+    problem_id: Any,
+    sample_id: Any,
+    turn_id: Any,
+) -> str:
+    normalized_problem_id = _coerce_nonnegative_int(problem_id)
+    normalized_sample_id = _coerce_nonnegative_int(sample_id)
+    normalized_turn_id = _coerce_nonnegative_int(turn_id)
+    if (
+        normalized_problem_id is None
+        or normalized_sample_id is None
+        or normalized_turn_id is None
+        or normalized_turn_id < 1
+    ):
+        return ""
+
+    notes_path = (
+        grading_results_dir
+        / "reasoning_summaries"
+        / f"p{normalized_problem_id}_s{normalized_sample_id}_turn_{normalized_turn_id}.txt"
+    )
+    return read_text_file(notes_path)
+
+
 def _format_percent(value: Any) -> str:
     if value is None:
         return "N/A"
@@ -187,14 +252,186 @@ def _format_percent(value: Any) -> str:
     return f"{numeric_value * 100:.2f}%"
 
 
-def extract_overview_metrics(metrics: dict[str, Any]) -> tuple[pd.DataFrame, str]:
-    best_by_turn_numbers: list[int] = []
-    for key in metrics:
-        matched = BEST_BY_TURN_PATTERN.match(key)
-        if matched:
-            best_by_turn_numbers.append(int(matched.group(1)))
+def _format_fast_threshold_token(value: float) -> str:
+    if abs(value - 1.0) < 1e-12:
+        return "1.0"
+    if float(value).is_integer():
+        return str(int(value))
+    return f"{value:g}"
 
-    latest_turn = max(best_by_turn_numbers) if best_by_turn_numbers else 1
+
+def _legacy_fast_threshold_token(value: float) -> str:
+    if float(value).is_integer():
+        return str(int(value))
+    return f"{value:g}"
+
+
+def _fast_metric_label(threshold: float) -> str:
+    return f"fast@p{_format_fast_threshold_token(threshold)}_in_all"
+
+
+def _parse_fast_threshold(label: str) -> float | None:
+    text = str(label).strip()
+    if text.startswith("p"):
+        text = text[1:]
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _supported_fast_threshold(value: float | None) -> float | None:
+    if value is None:
+        return None
+    for threshold in FAST_THRESHOLDS:
+        if abs(value - threshold) < 1e-12:
+            return threshold
+    return None
+
+
+def _find_fast_metric_value(
+    metrics: dict[str, Any],
+    scope: str,
+    turn_id: int,
+    threshold: float,
+) -> tuple[str, Any] | tuple[None, None]:
+    legacy_token = _legacy_fast_threshold_token(threshold)
+    visible_token = _format_fast_threshold_token(threshold)
+    candidates = [
+        f"val/kernel/{scope}_{turn_id}/fast@{legacy_token}_in_all",
+        f"val/kernel/{scope}_{turn_id}/fast@p{visible_token}_in_all",
+    ]
+    for key in candidates:
+        if key in metrics:
+            return key, metrics[key]
+    return None, None
+
+
+def _detect_latest_turn(
+    metrics: dict[str, Any],
+    samples: list[dict[str, Any]] | None = None,
+    observed_max_turn: int | None = None,
+) -> int:
+    turn_numbers: list[int] = []
+    if observed_max_turn and observed_max_turn > 0:
+        turn_numbers.append(observed_max_turn)
+
+    for key in metrics:
+        best_match = BEST_BY_TURN_PATTERN.match(key)
+        if best_match:
+            turn_numbers.append(int(best_match.group(1)))
+            continue
+        turn_match = TURN_METRIC_PATTERN.match(key)
+        if turn_match:
+            turn_numbers.append(int(turn_match.group(1)))
+
+    for sample in samples or []:
+        for turn in sample.get("turns", []):
+            turn_id = _coerce_nonnegative_int(turn.get("turn_id"))
+            if turn_id:
+                turn_numbers.append(turn_id)
+
+    return max(turn_numbers) if turn_numbers else 1
+
+
+def _conversation_turn_speedup(turn: dict[str, Any]) -> float:
+    metrics = turn.get("metrics") or {}
+    return fast_filter.parse_floatish(
+        _first_present(
+            metrics.get("performance"),
+            metrics.get("speedup"),
+            turn.get("performance"),
+            turn.get("speedup"),
+            turn.get("score"),
+        ),
+        default=0.0,
+    )
+
+
+def _conversation_turn_qualifies(turn: dict[str, Any], threshold: float) -> bool:
+    metrics = turn.get("metrics") or {}
+    correctness = fast_filter.parse_boolish(
+        _first_present(metrics.get("correctness"), turn.get("correctness"))
+    )
+    is_decoy = fast_filter.parse_boolish(
+        _first_present(
+            metrics.get("is_decoy_kernel"),
+            metrics.get("decoy_kernel"),
+            turn.get("is_decoy_kernel"),
+            turn.get("decoy_kernel"),
+            False,
+        )
+    )
+    return correctness and not is_decoy and _conversation_turn_speedup(turn) >= threshold
+
+
+def derive_fast_trend_data_from_samples(
+    samples: list[dict[str, Any]] | None,
+    observed_max_turn: int | None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    samples = samples or []
+    latest_turn = _detect_latest_turn({}, samples=samples, observed_max_turn=observed_max_turn)
+    if not samples or latest_turn < 1:
+        empty = pd.DataFrame(columns=["turn", "metric", "value"])
+        return empty, empty
+
+    turn_rows: list[dict[str, Any]] = []
+    best_rows: list[dict[str, Any]] = []
+    denominator = len(samples)
+
+    for turn_id in range(1, latest_turn + 1):
+        for threshold in FAST_THRESHOLDS:
+            metric_label = _fast_metric_label(threshold)
+            turn_hits = 0
+            best_hits = 0
+
+            for sample in samples:
+                turns_by_id: dict[int, dict[str, Any]] = {}
+                for turn in sample.get("turns", []):
+                    normalized_turn_id = _coerce_nonnegative_int(turn.get("turn_id"))
+                    if normalized_turn_id is not None and normalized_turn_id >= 1:
+                        turns_by_id[normalized_turn_id] = turn
+
+                selected_turn = turns_by_id.get(turn_id)
+                if selected_turn and _conversation_turn_qualifies(selected_turn, threshold):
+                    turn_hits += 1
+
+                if any(
+                    candidate_turn_id <= turn_id
+                    and _conversation_turn_qualifies(candidate_turn, threshold)
+                    for candidate_turn_id, candidate_turn in turns_by_id.items()
+                ):
+                    best_hits += 1
+
+            turn_rows.append(
+                {
+                    "turn": turn_id,
+                    "metric": metric_label,
+                    "value": turn_hits / denominator,
+                }
+            )
+            best_rows.append(
+                {
+                    "turn": turn_id,
+                    "metric": metric_label,
+                    "value": best_hits / denominator,
+                }
+            )
+
+    return pd.DataFrame(turn_rows), pd.DataFrame(best_rows)
+
+
+def extract_overview_metrics(
+    metrics: dict[str, Any],
+    samples: list[dict[str, Any]] | None = None,
+    observed_max_turn: int | None = None,
+) -> tuple[pd.DataFrame, str]:
+    latest_turn = _detect_latest_turn(metrics, samples=samples, observed_max_turn=observed_max_turn)
+    _, derived_best_df = derive_fast_trend_data_from_samples(samples, latest_turn)
+    derived_best_lookup = {
+        (int(row["turn"]), str(row["metric"])): row["value"]
+        for row in derived_best_df.to_dict("records")
+    }
 
     pass_at_1_key = None
     for key in metrics:
@@ -207,9 +444,10 @@ def extract_overview_metrics(metrics: dict[str, Any]) -> tuple[pd.DataFrame, str
                 pass_at_1_key = key
                 break
 
-    fast12_key = f"val/kernel/best_by_turn_{latest_turn}/fast@1.2_in_all"
-    fast10_key = f"val/kernel/best_by_turn_{latest_turn}/fast@1_in_all"
     final_correct_key = "val/kernel/final/correctness_rate"
+    latest_correct_key = f"val/kernel/turn_{latest_turn}/correctness_rate"
+    correctness_key = final_correct_key if final_correct_key in metrics else latest_correct_key
+    correctness_label = "final/correctness_rate" if final_correct_key in metrics else f"turn_{latest_turn} correctness_rate"
 
     rows = [
         {
@@ -218,21 +456,31 @@ def extract_overview_metrics(metrics: dict[str, Any]) -> tuple[pd.DataFrame, str
             "source_key": pass_at_1_key or "N/A",
         },
         {
-            "metric": f"best_by_turn_{latest_turn} fast@1.2_in_all",
-            "value": _format_percent(metrics.get(fast12_key)),
-            "source_key": fast12_key,
-        },
-        {
-            "metric": f"best_by_turn_{latest_turn} fast@1.0_in_all",
-            "value": _format_percent(metrics.get(fast10_key)),
-            "source_key": fast10_key,
-        },
-        {
-            "metric": "final/correctness_rate",
-            "value": _format_percent(metrics.get(final_correct_key)),
-            "source_key": final_correct_key,
+            "metric": correctness_label,
+            "value": _format_percent(metrics.get(correctness_key)),
+            "source_key": correctness_key,
         },
     ]
+    for threshold in FAST_THRESHOLDS:
+        metric_label = _fast_metric_label(threshold)
+        source_key, source_value = _find_fast_metric_value(
+            metrics,
+            "best_by_turn",
+            latest_turn,
+            threshold,
+        )
+        if source_key is None:
+            source_value = derived_best_lookup.get((latest_turn, metric_label))
+            source_key = f"derived:val/kernel/best_by_turn_{latest_turn}/{metric_label}"
+
+        rows.append(
+            {
+                "metric": f"best_by_turn_{latest_turn} {metric_label}",
+                "value": _format_percent(source_value),
+                "source_key": source_key,
+            }
+        )
+
     for key in sorted(metrics):
         if not key.startswith(NCU_OVERVIEW_PREFIX):
             continue
@@ -250,26 +498,37 @@ def extract_overview_metrics(metrics: dict[str, Any]) -> tuple[pd.DataFrame, str
 
     summary_md = (
         "### Overview\n"
-        f"- Latest cumulative turn detected: **{latest_turn}**"
+        f"- Latest turn detected: **{latest_turn}**\n"
+        f"- Best-by-turn summary: **best_by_turn_{latest_turn}**"
     )
     return df, summary_md
 
 
 def _normalize_fast_threshold_label(label: str) -> str:
-    return "1.0" if label == "1" else label
+    threshold = _parse_fast_threshold(label)
+    if threshold is None:
+        return str(label)
+    return f"p{_format_fast_threshold_token(threshold)}"
 
 
-def extract_fast_trend_data(metrics: dict[str, Any]) -> tuple[pd.DataFrame, pd.DataFrame]:
+def extract_fast_trend_data(
+    metrics: dict[str, Any],
+    samples: list[dict[str, Any]] | None = None,
+    observed_max_turn: int | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     turn_rows: list[dict[str, Any]] = []
     best_rows: list[dict[str, Any]] = []
 
     for key, value in metrics.items():
         turn_match = TURN_FAST_PATTERN.match(key)
         if turn_match:
+            threshold = _supported_fast_threshold(_parse_fast_threshold(turn_match.group(2)))
+            if threshold is None:
+                continue
             turn_rows.append(
                 {
                     "turn": int(turn_match.group(1)),
-                    "metric": f"fast@{_normalize_fast_threshold_label(turn_match.group(2))}_in_all",
+                    "metric": _fast_metric_label(threshold),
                     "value": _safe_float(value),
                 }
             )
@@ -277,13 +536,32 @@ def extract_fast_trend_data(metrics: dict[str, Any]) -> tuple[pd.DataFrame, pd.D
 
         best_match = BEST_BY_TURN_FAST_PATTERN.match(key)
         if best_match:
+            threshold = _supported_fast_threshold(_parse_fast_threshold(best_match.group(2)))
+            if threshold is None:
+                continue
             best_rows.append(
                 {
                     "turn": int(best_match.group(1)),
-                    "metric": f"fast@{_normalize_fast_threshold_label(best_match.group(2))}_in_all",
+                    "metric": _fast_metric_label(threshold),
                     "value": _safe_float(value),
                 }
             )
+
+    derived_turn_df, derived_best_df = derive_fast_trend_data_from_samples(samples, observed_max_turn)
+    if not derived_turn_df.empty:
+        turn_keys = {(int(row["turn"]), str(row["metric"])) for row in turn_rows}
+        for row in derived_turn_df.to_dict("records"):
+            key = (int(row["turn"]), str(row["metric"]))
+            if key not in turn_keys:
+                turn_rows.append(row)
+                turn_keys.add(key)
+    if not derived_best_df.empty:
+        best_keys = {(int(row["turn"]), str(row["metric"])) for row in best_rows}
+        for row in derived_best_df.to_dict("records"):
+            key = (int(row["turn"]), str(row["metric"]))
+            if key not in best_keys:
+                best_rows.append(row)
+                best_keys.add(key)
 
     turn_df = (
         pd.DataFrame(turn_rows, columns=["turn", "metric", "value"])
@@ -334,8 +612,8 @@ def build_eval_outputs_table(
                 continue
 
         final_turn = turn_evals[-1] if turn_evals else {}
-        turn_speedups = [_safe_float(item.get("performance")) for item in turn_evals]
-        final_speedup = _safe_float(final_turn.get("performance")) if final_turn else 0.0
+        turn_speedups = [_turn_speedup(item) for item in turn_evals]
+        final_speedup = _turn_speedup(final_turn) if final_turn else 0.0
         best_speedup = max(turn_speedups) if turn_speedups else 0.0
         speedup_positive_any = any(bool(item.get("is_speedup_positive")) for item in turn_evals)
         final_ncu_fma_ratio = _safe_float(final_turn.get("ncu_fma_instruction_ratio")) if final_turn else 0.0
@@ -350,6 +628,8 @@ def build_eval_outputs_table(
             conversation_text = conversation_path.read_text(encoding="utf-8", errors="replace")
         else:
             conversation_text = ""
+        optimization_notes_path = sample_dir / "optimization_notes.txt"
+        optimization_notes_text = read_text_file(optimization_notes_path)
 
         reference_path = sample_dir / "reference.py"
         if reference_path.exists():
@@ -371,6 +651,8 @@ def build_eval_outputs_table(
             "speedup_positive_any": speedup_positive_any,
             "final_ncu_fma_instruction_ratio": final_ncu_fma_ratio,
             "final_ncu_active_elapsed_cycle_ratio": final_ncu_cycle_ratio,
+            "has_optimization_notes": bool(optimization_notes_text),
+            "optimization_notes_path": str(optimization_notes_path) if optimization_notes_path.exists() else "",
             "dialogue_log_path": str(conversation_path) if conversation_path.exists() else "",
             "sample_dir_name": sample_dir.name,
         }
@@ -381,6 +663,8 @@ def build_eval_outputs_table(
             "final_turn_eval": final_turn,
             "all_turn_evals": turn_evals,
             "conversation_text": conversation_text,
+            "optimization_notes_text": optimization_notes_text,
+            "optimization_notes_by_turn": parse_optimization_notes_by_turn(optimization_notes_text),
             "reference_code": reference_code,
             "inductor_reference_code": str(inductor_reference_detail.get("code", "")),
             "inductor_reference_row_idx": inductor_reference_detail.get("row_idx"),
@@ -400,6 +684,8 @@ def build_eval_outputs_table(
                 "speedup_positive_any",
                 "final_ncu_fma_instruction_ratio",
                 "final_ncu_active_elapsed_cycle_ratio",
+                "has_optimization_notes",
+                "optimization_notes_path",
                 "dialogue_log_path",
                 "sample_dir_name",
             ]
@@ -436,6 +722,7 @@ def build_eval_outputs_detail_map(
     response_index: dict[str, dict[int, str]],
 ) -> dict[str, dict[str, Any]]:
     enriched = dict(base_detail_map)
+    grading_results_dir = eval_outputs_dir.parent
 
     for sample_dir_name, detail in list(enriched.items()):
         sample_dir = eval_outputs_dir / sample_dir_name
@@ -462,7 +749,7 @@ def build_eval_outputs_detail_map(
                 continue
 
             try:
-                turn_id = int(turn_eval.get("turn_id", -1))
+                turn_id = int(_first_present(turn_eval.get("turn_id"), _extract_turn_id(turn_eval_file)))
             except (TypeError, ValueError):
                 continue
             if turn_id < 1:
@@ -473,17 +760,26 @@ def build_eval_outputs_detail_map(
                 kernel_code = kernel_path.read_text(encoding="utf-8", errors="replace")
             else:
                 kernel_code = ""
+            turn_notes = read_visible_optimization_notes(
+                grading_results_dir,
+                summary.get("problem_id", turn_eval.get("problem_id")),
+                summary.get("sample_id", turn_eval.get("sample_id")),
+                turn_id,
+            )
+            if not turn_notes:
+                turn_notes = str(detail.get("optimization_notes_by_turn", {}).get(turn_id, ""))
 
             turn_items.append(
                 {
                     "turn_id": turn_id,
                     "score": _safe_float(turn_eval.get("score")),
-                    "speedup": _safe_float(turn_eval.get("performance")),
+                    "speedup": _turn_speedup(turn_eval),
                     "correctness": bool(turn_eval.get("correctness", False)),
-                    "compiled": bool(turn_eval.get("compilation", False)),
+                    "compiled": bool(_first_present(turn_eval.get("compilation"), turn_eval.get("compiled"), False)),
                     "ncu": turn_eval.get("ncu"),
                     "kernel_code": kernel_code,
                     "response": turn_responses.get(turn_id, ""),
+                    "optimization_notes": turn_notes,
                 }
             )
             for key, value in turn_eval.items():
@@ -546,6 +842,7 @@ def build_turn_payload_map(turn_items: list[dict[str, Any]]) -> dict[str, dict[s
         payload_map[str(turn_id)] = {
             "kernel_code": str(item.get("kernel_code", "")),
             "response": str(item.get("response", "")),
+            "optimization_notes": str(item.get("optimization_notes", "")),
         }
     return payload_map
 
@@ -576,11 +873,30 @@ def build_fast_filter_table(
         )
 
         reference_code = ""
+        optimization_notes_text = ""
+        selected_optimization_notes = ""
         source_eval_output_dir = item.get("source_eval_output_dir")
         if source_eval_output_dir:
-            reference_path = Path(str(source_eval_output_dir)) / "reference.py"
+            source_eval_output_path = Path(str(source_eval_output_dir))
+            reference_path = source_eval_output_path / "reference.py"
             if reference_path.exists():
                 reference_code = reference_path.read_text(encoding="utf-8", errors="replace")
+            optimization_notes_text = read_text_file(source_eval_output_path / "optimization_notes.txt")
+            grading_results_dir = (
+                source_eval_output_path.parent.parent
+                if source_eval_output_path.parent.name == "eval_outputs"
+                else source_eval_output_path
+            )
+            selected_optimization_notes = read_visible_optimization_notes(
+                grading_results_dir,
+                problem_id,
+                sample_id,
+                item.get("qualified_turn_id"),
+            )
+            if not selected_optimization_notes:
+                selected_optimization_notes = parse_optimization_notes_by_turn(
+                    optimization_notes_text
+                ).get(_coerce_nonnegative_int(item.get("qualified_turn_id")) or -1, "")
         inductor_reference_detail = get_inductor_reference_detail(
             problem_id,
             inductor_reference_code_index,
@@ -589,6 +905,8 @@ def build_fast_filter_table(
         detail_map[uid] = {
             "item": item,
             "conversation_text": full_conversation_text,
+            "optimization_notes_text": optimization_notes_text,
+            "selected_optimization_notes": selected_optimization_notes,
             "selected_kernel": selected_kernel,
             "selected_response": str(item.get("selected_response", "")),
             "reference_code": reference_code,
@@ -634,13 +952,22 @@ def load_dashboard_data(run_path: str, threshold: float, metric_prefix: str):
     try:
         grading_results = resolve_grading_results_path(run_path)
         metrics = read_json_file(grading_results / "metrics.json")
-        overview_df, overview_summary = extract_overview_metrics(metrics)
-        turn_fast_df, best_by_turn_fast_df = extract_fast_trend_data(metrics)
+        conversations_path, metrics_path, eval_outputs_path = resolve_filter_inputs(grading_results)
+        samples, observed_max_turn = fast_filter.load_samples_from_conversations(conversations_path)
+        overview_df, overview_summary = extract_overview_metrics(
+            metrics,
+            samples=samples,
+            observed_max_turn=observed_max_turn,
+        )
+        turn_fast_df, best_by_turn_fast_df = extract_fast_trend_data(
+            metrics,
+            samples=samples,
+            observed_max_turn=observed_max_turn,
+        )
         inductor_reference_code_index = build_inductor_reference_code_index()
 
         eval_outputs_dir = grading_results / "eval_outputs"
         eval_df, detail_map = build_eval_outputs_table(eval_outputs_dir, inductor_reference_code_index)
-        conversations_path, metrics_path, eval_outputs_path = resolve_filter_inputs(grading_results)
         response_index = load_turn_response_index(conversations_path)
         detail_map = build_eval_outputs_detail_map(eval_outputs_dir, detail_map, response_index)
         metric_prefix_choices = build_metric_prefix_choices(conversations_path)
@@ -724,11 +1051,11 @@ def load_dashboard_data(run_path: str, threshold: float, metric_prefix: str):
 
 def show_sample_detail(evt: gr.SelectData, eval_df: pd.DataFrame, detail_map: dict[str, dict[str, Any]]):
     if eval_df is None or len(eval_df) == 0:
-        return {}, "", "", "", gr.update(choices=[], value=None), "", "", {}
+        return {}, "", "", "", "", gr.update(choices=[], value=None), "", "", "", {}
 
     row_index = evt.index[0] if isinstance(evt.index, (list, tuple)) else int(evt.index)
     if row_index < 0 or row_index >= len(eval_df):
-        return {}, "", "", "", gr.update(choices=[], value=None), "", "", {}
+        return {}, "", "", "", "", gr.update(choices=[], value=None), "", "", "", {}
 
     sample_dir_name = str(eval_df.iloc[row_index]["sample_dir_name"])
     detail = detail_map.get(sample_dir_name, {})
@@ -746,22 +1073,29 @@ def show_sample_detail(evt: gr.SelectData, eval_df: pd.DataFrame, detail_map: di
             detail.get("inductor_reference_meta_problem_id")
         ),
         "inductor_reference_meta_file": detail.get("inductor_reference_meta_file", ""),
+        "has_optimization_notes": bool(detail.get("optimization_notes_text")),
         "turn_metrics": build_turn_metrics_summary(turn_items),
     }
     reference_code = detail.get("reference_code", "")
     inductor_reference_code = detail.get("inductor_reference_code", "")
     conversation_text = detail.get("conversation_text", "")
+    optimization_notes_text = detail.get("optimization_notes_text", "")
     kernel_code, response_text, selected_turn_id, all_turn_ids = _pick_turn_payload(detail, turn_id=None)
     turn_dropdown_update = gr.update(choices=all_turn_ids, value=selected_turn_id)
     turn_payload_map = build_turn_payload_map(turn_items)
+    selected_turn_notes = ""
+    if selected_turn_id is not None:
+        selected_turn_notes = str(turn_payload_map.get(str(selected_turn_id), {}).get("optimization_notes", ""))
     return (
         detail_json,
         reference_code,
         inductor_reference_code,
         conversation_text,
+        optimization_notes_text,
         turn_dropdown_update,
         kernel_code,
         response_text,
+        selected_turn_notes,
         turn_payload_map,
     )
 
@@ -769,9 +1103,9 @@ def show_sample_detail(evt: gr.SelectData, eval_df: pd.DataFrame, detail_map: di
 def show_eval_turn_content(
     turn_id: int | None,
     turn_payload_map: dict[str, dict[str, str]],
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     if not turn_payload_map:
-        return "", ""
+        return "", "", ""
 
     if turn_id is None:
         selected_key = sorted(turn_payload_map.keys(), key=lambda item: int(item))[0]
@@ -781,16 +1115,20 @@ def show_eval_turn_content(
             selected_key = sorted(turn_payload_map.keys(), key=lambda item: int(item))[0]
 
     selected = turn_payload_map.get(selected_key, {})
-    return str(selected.get("kernel_code", "")), str(selected.get("response", ""))
+    return (
+        str(selected.get("kernel_code", "")),
+        str(selected.get("response", "")),
+        str(selected.get("optimization_notes", "")),
+    )
 
 
 def show_filtered_detail(evt: gr.SelectData, filter_df: pd.DataFrame, filter_detail_map: dict[str, dict[str, Any]]):
     if filter_df is None or len(filter_df) == 0:
-        return {}, "", "", "", "", ""
+        return {}, "", "", "", "", "", ""
 
     row_index = evt.index[0] if isinstance(evt.index, (list, tuple)) else int(evt.index)
     if row_index < 0 or row_index >= len(filter_df):
-        return {}, "", "", "", "", ""
+        return {}, "", "", "", "", "", ""
 
     uid = str(filter_df.iloc[row_index]["uid"])
     detail = filter_detail_map.get(uid, {})
@@ -811,6 +1149,7 @@ def show_filtered_detail(evt: gr.SelectData, filter_df: pd.DataFrame, filter_det
         "qualified_turn_performance": item.get("qualified_turn_performance"),
         "source_eval_output_name": item.get("source_eval_output_name"),
         "full_conversation_path": item.get("full_conversation_path"),
+        "has_optimization_notes": bool(detail.get("selected_optimization_notes") or detail.get("optimization_notes_text")),
     }
     return (
         detail_json,
@@ -819,6 +1158,7 @@ def show_filtered_detail(evt: gr.SelectData, filter_df: pd.DataFrame, filter_det
         detail.get("conversation_text", ""),
         detail.get("selected_kernel", ""),
         detail.get("selected_response", ""),
+        detail.get("selected_optimization_notes") or detail.get("optimization_notes_text", ""),
     )
 
 
@@ -888,6 +1228,11 @@ def build_app(initial_run_path: str = DEFAULT_RUN_PATH) -> gr.Blocks:
                         lines=24,
                         max_lines=36,
                     )
+                    optimization_notes_box = gr.Textbox(
+                        label="Optimization Notes (Visible)",
+                        lines=12,
+                        max_lines=18,
+                    )
             with gr.Row():
                 eval_turn_selector = gr.Dropdown(
                     label="Turn",
@@ -903,6 +1248,11 @@ def build_app(initial_run_path: str = DEFAULT_RUN_PATH) -> gr.Blocks:
                 )
                 eval_turn_response_box = gr.Textbox(
                     label="Selected Turn Response",
+                    lines=16,
+                    max_lines=24,
+                )
+                eval_turn_notes_box = gr.Textbox(
+                    label="Selected Turn Optimization Notes",
                     lines=16,
                     max_lines=24,
                 )
@@ -931,6 +1281,11 @@ def build_app(initial_run_path: str = DEFAULT_RUN_PATH) -> gr.Blocks:
                     )
                     filtered_response_box = gr.Textbox(
                         label="Selected Response",
+                        lines=10,
+                        max_lines=14,
+                    )
+                    filtered_optimization_notes_box = gr.Textbox(
+                        label="Selected Turn Optimization Notes",
                         lines=10,
                         max_lines=14,
                     )
@@ -971,9 +1326,11 @@ def build_app(initial_run_path: str = DEFAULT_RUN_PATH) -> gr.Blocks:
                 reference_code_box,
                 inductor_reference_code_box,
                 conversation_box,
+                optimization_notes_box,
                 eval_turn_selector,
                 eval_turn_kernel_box,
                 eval_turn_response_box,
+                eval_turn_notes_box,
                 eval_turn_payload_state,
             ],
         )
@@ -981,7 +1338,7 @@ def build_app(initial_run_path: str = DEFAULT_RUN_PATH) -> gr.Blocks:
         eval_turn_selector.change(
             fn=show_eval_turn_content,
             inputs=[eval_turn_selector, eval_turn_payload_state],
-            outputs=[eval_turn_kernel_box, eval_turn_response_box],
+            outputs=[eval_turn_kernel_box, eval_turn_response_box, eval_turn_notes_box],
         )
 
         filter_table.select(
@@ -994,6 +1351,7 @@ def build_app(initial_run_path: str = DEFAULT_RUN_PATH) -> gr.Blocks:
                 filtered_conversation_box,
                 filtered_kernel_box,
                 filtered_response_box,
+                filtered_optimization_notes_box,
             ],
         )
 
