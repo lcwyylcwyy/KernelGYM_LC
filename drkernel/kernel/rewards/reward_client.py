@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import time
 import logging
+import json
 from typing import Any, Dict, List, Optional, Tuple
 import random
 from uuid import uuid4
@@ -27,6 +28,38 @@ from verl.tools.sandbox_fusion_tools import TokenBucketWorker
 
 
 logger = logging.getLogger(__name__)
+
+
+def _coerce_ncu_metrics(metrics: Any) -> Optional[List[str]]:
+    if metrics is None or metrics == "":
+        return None
+    if isinstance(metrics, str):
+        try:
+            parsed = json.loads(metrics)
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        except Exception:
+            pass
+        return [item.strip() for item in metrics.split(",") if item.strip()]
+    if isinstance(metrics, (list, tuple)):
+        return [str(item).strip() for item in metrics if str(item).strip()]
+    return None
+
+
+def _extract_ncu_fields(result: Dict[str, Any]) -> Dict[str, Any]:
+    fields: Dict[str, Any] = {}
+    metadata = result.get("metadata") if isinstance(result, dict) else None
+    if isinstance(metadata, dict):
+        ncu_payload = metadata.get("ncu")
+        if isinstance(ncu_payload, dict):
+            fields["ncu"] = ncu_payload
+        for key, value in metadata.items():
+            if str(key).startswith("ncu_"):
+                fields[key] = value
+    for key, value in (result or {}).items():
+        if str(key).startswith("ncu_"):
+            fields[key] = value
+    return fields
 
 
 @ray.remote
@@ -549,6 +582,7 @@ class KernelRewardClient:
             merged.update(raw_result)
         if reward_summary:
             merged.update(reward_summary)
+        merged.update(_extract_ncu_fields(raw_result or {}))
         return merged
 
     async def compute_batch_rewards(
@@ -648,6 +682,16 @@ class KernelRewardClient:
                 "detect_decoy_kernel": task.get("detect_decoy_kernel", True),
                 "reference_backend": task.get("reference_backend", None),
             }
+            enable_ncu_profiling = task.get(
+                "enable_ncu_profiling",
+                getattr(self.reward_config, "enable_ncu_profiling", False),
+            )
+            payload["enable_ncu_profiling"] = bool(enable_ncu_profiling)
+            ncu_metrics = _coerce_ncu_metrics(
+                task.get("ncu_metrics", getattr(self.reward_config, "ncu_metrics", None))
+            )
+            if ncu_metrics:
+                payload["ncu_metrics"] = ncu_metrics
 
             # enforce detect decoy kernel if validate
             if payload["is_valid"]:

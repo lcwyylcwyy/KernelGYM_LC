@@ -64,6 +64,10 @@ class KernelBenchToolkit(Toolkit):
                 KernelEvaluationTask.from_dict(task),
                 verbose_errors=task.get("verbose_errors", True),
                 enable_profiling=task.get("enable_profiling", settings.enable_profiling),
+                enable_ncu_profiling=task.get(
+                    "enable_ncu_profiling",
+                    settings.enable_ncu_profiling,
+                ),
                 backend_adapter=backend,
             )
         else:
@@ -116,6 +120,9 @@ class KernelBenchToolkit(Toolkit):
             enable_profiling = task.enable_profiling
             if enable_profiling is None:
                 enable_profiling = settings.enable_profiling
+            enable_ncu_profiling = task.enable_ncu_profiling
+            if enable_ncu_profiling is None:
+                enable_ncu_profiling = settings.enable_ncu_profiling
 
             result = kernelbench_pipeline.eval_kernel_against_ref(
                 original_model_src=task.reference_code,
@@ -128,6 +135,8 @@ class KernelBenchToolkit(Toolkit):
                 backend=task.backend,
                 entry_point=task.entry_point,
                 enable_profiling=bool(enable_profiling),
+                enable_ncu_profiling=bool(enable_ncu_profiling),
+                ncu_metrics=task.ncu_metrics or settings.ncu_metrics,
                 enable_triton_detection=enable_triton_detection,
                 backend_adapter=backend_adapter,
             )
@@ -252,6 +261,7 @@ class KernelBenchToolkit(Toolkit):
         task: KernelEvaluationTask,
         verbose_errors: bool = True,
         enable_profiling: bool = False,
+        enable_ncu_profiling: bool = False,
         backend_adapter=None,
     ) -> KernelEvaluationResult:
         device = torch.device(task.device)
@@ -304,6 +314,8 @@ class KernelBenchToolkit(Toolkit):
                 backend=task.backend,
                 entry_point=task.entry_point,
                 enable_profiling=enable_profiling,
+                enable_ncu_profiling=bool(enable_ncu_profiling),
+                ncu_metrics=task.ncu_metrics or settings.ncu_metrics,
                 enable_triton_detection=enable_triton_detection,
                 backend_adapter=backend_adapter,
             )

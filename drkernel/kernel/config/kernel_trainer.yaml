@@ -45,6 +45,16 @@ reward_model:
   num_perf_trials: 100
   num_correct_trials: 5
   enable_profiling: true
+  enable_ncu_profiling: false
+  ncu_metrics:
+    - sm__inst_executed_pipe_fma.sum
+    - sm__inst_executed.sum
+    - sm__cycles_active.avg
+    - sm__cycles_elapsed.avg
+    - l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum
+    - l1tex__t_sector_hit_rate.pct
+    - smsp__warp_issue_stalled_barrier_per_warp_active.pct
+    - smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct
   verbose_errors: true
   coverage_reward:
     reward_type: "time_coverage"  # time_coverage: cutom_kernel_time_us / total_kernel_time_us, number_coverage: num_custom_kernel / num_total_kernels
@@ -74,6 +84,8 @@ reward_model:
     num_perf_trials: ${reward_model.num_perf_trials}
     num_correct_trials: ${reward_model.num_correct_trials}
     enable_profiling: ${reward_model.enable_profiling}
+    enable_ncu_profiling: ${reward_model.enable_ncu_profiling}
+    ncu_metrics: ${reward_model.ncu_metrics}
     verbose_errors: ${reward_model.verbose_errors}
   # Reference caching configuration
   reference_cache:

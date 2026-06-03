@@ -110,6 +110,8 @@ REWARD_PRINT_STATUS=${REWARD_PRINT_STATUS:-True}
 SAME_GPU_MODE=${SAME_GPU_MODE:-False}
 NUM_PERF_TRIALS=${NUM_PERF_TRIALS:-100}
 NUM_CORRECT_TRIALS=${NUM_CORRECT_TRIALS:-5}
+ENABLE_NCU_PROFILING=${ENABLE_NCU_PROFILING:-False}
+NCU_METRICS=${NCU_METRICS:-"sm__inst_executed_pipe_fma.sum,sm__inst_executed.sum,sm__cycles_active.avg,sm__cycles_elapsed.avg,l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum,l1tex__t_sector_hit_rate.pct,smsp__warp_issue_stalled_barrier_per_warp_active.pct,smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct"}
 SPEEDUP_REWARD_UPPER_BOUND=${SPEEDUP_REWARD_UPPER_BOUND:-3.0}
 
 # Reward Weights (compilation, correctness, performance)
@@ -297,6 +299,8 @@ parse_arguments() {
       --reward_weights) REWARD_WEIGHTS="$2"; shift 2 ;;
       --num_perf_trials) NUM_PERF_TRIALS="$2"; shift 2 ;;
       --num_correct_trials) NUM_CORRECT_TRIALS="$2"; shift 2 ;;
+      --enable_ncu_profiling) ENABLE_NCU_PROFILING="$2"; shift 2 ;;
+      --ncu_metrics) NCU_METRICS="$2"; shift 2 ;;
       --speedup_reward_upper_bound) SPEEDUP_REWARD_UPPER_BOUND="$2"; shift 2 ;;
       --custom_reward_path) CUSTOM_REWARD_PATH="$2"; shift 2 ;;
       --custom_reward_name) CUSTOM_REWARD_NAME="$2"; shift 2 ;;
@@ -466,6 +470,7 @@ setup_grading_environment() {
   echo "  Compilation Weight: $REWARD_WEIGHT_COMPILATION"
   echo "  Correctness Weight: $REWARD_WEIGHT_CORRECTNESS"
   echo "  Performance Weight: $REWARD_WEIGHT_PERFORMANCE"
+  echo "  NCU Profiling: $ENABLE_NCU_PROFILING"
   echo ""
   echo "System Configuration:"
   echo "  Nodes: $NNODES"
@@ -569,6 +574,8 @@ run_grading() {
       reward_model.same_gpu_mode=$SAME_GPU_MODE \
       reward_model.num_perf_trials=$NUM_PERF_TRIALS \
       reward_model.num_correct_trials=$NUM_CORRECT_TRIALS \
+      reward_model.enable_ncu_profiling=$ENABLE_NCU_PROFILING \
+      reward_model.ncu_metrics='"'$NCU_METRICS'"' \
       reward_model.speedup_reward_upper_bound=$SPEEDUP_REWARD_UPPER_BOUND \
       reward_model.reward_weights.compilation=$REWARD_WEIGHT_COMPILATION \
       reward_model.reward_weights.correctness=$REWARD_WEIGHT_CORRECTNESS \

@@ -133,15 +133,21 @@ def _accumulate_reward_extra_metrics(
     valid_reward_extra_info_list = [reward_extra_info_list[i] for i in valid_indices]
     valid_data_sources = [cur_data_source[i] for i in valid_indices]
 
-    raw_reward_extra_info_dict = {
-        key: [info[key] for info in valid_reward_extra_info_list]
-        for key in valid_reward_extra_info_list[0].keys()
-    }
-
-    for key, extra_reward in raw_reward_extra_info_dict.items():
-        for i, data_source in enumerate(valid_data_sources):
+    reward_extra_keys = sorted(
+        {
+            key
+            for info in valid_reward_extra_info_list
+            if isinstance(info, dict)
+            for key in info.keys()
+            if key not in {"reward_extra_info", "ncu"}
+        }
+    )
+    for key in reward_extra_keys:
+        for info, data_source in zip(valid_reward_extra_info_list, valid_data_sources):
+            if key not in info:
+                continue
             composed_key = f"{key}_{data_source}"
-            reward_extra_info_dict[composed_key].append(extra_reward[i])
+            reward_extra_info_dict[composed_key].append(info[key])
 
 
 def _extend_raw_response_logs(
@@ -1298,7 +1304,7 @@ def _run_deferred_profiling(output_batch, input_batch, config, tokenizer):
 
         # Update reward_extra_info with profiling results
         if row_idx < len(reward_extra_info_list) and isinstance(reward_extra_info_list[row_idx], dict):
-            reward_extra_info_list[row_idx].update({
+            update_payload = {
                 "performance": result.get("speedup", 0.0),
                 "is_speedup_positive": (result.get("speedup") or 0.0) >= 1.0 + getattr(
                     config.reward_model, "speedup_eps", 0.01
@@ -1312,7 +1318,19 @@ def _run_deferred_profiling(output_batch, input_batch, config, tokenizer):
                 "total_kernel_run_time_in_profiling_us": result.get(
                     "total_kernel_run_time_in_profiling_us", 0
                 ),
-            })
+            }
+            metadata = result.get("metadata") if isinstance(result, dict) else None
+            if isinstance(metadata, dict) and isinstance(metadata.get("ncu"), dict):
+                update_payload["ncu"] = metadata["ncu"]
+            if isinstance(result.get("ncu"), dict):
+                update_payload["ncu"] = result["ncu"]
+            for source in (metadata, result):
+                if not isinstance(source, dict):
+                    continue
+                for key, value in source.items():
+                    if str(key).startswith("ncu_"):
+                        update_payload[key] = value
+            reward_extra_info_list[row_idx].update(update_payload)
 
     output_batch.batch["token_level_scores"] = token_level_scores
     output_batch.non_tensor_batch["reward_extra_info"] = np.array(reward_extra_info_list, dtype=object)

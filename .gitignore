@@ -1,3 +1,4 @@
 data/
 .claude/
+__pycache__/
 *.pyc

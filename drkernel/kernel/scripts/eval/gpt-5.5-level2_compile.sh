@@ -19,12 +19,39 @@
 # --- Proxy fix: OpenAI SDK crashes with SOCKS proxy ---
 unset ALL_PROXY all_proxy HTTP_PROXY http_proxy HTTPS_PROXY https_proxy
 
+USER_PROJECT_NAME="${PROJECT_NAME:-}"
+USER_RUN_NAME="${RUN_NAME:-}"
+USER_EXPERIMENT_NAME="${EXPERIMENT_NAME:-}"
+USER_EVAL_DATASET="${EVAL_DATASET:-}"
+USER_OUTPUT_DIR="${OUTPUT_DIR:-}"
+USER_OUTPUT_PATH="${OUTPUT_PATH:-}"
+USER_METRICS_OUTPUT_PATH="${METRICS_OUTPUT_PATH:-}"
+USER_RAW_RESPONSE_PATH="${RAW_RESPONSE_PATH:-}"
+USER_N_SAMPLES="${N_SAMPLES:-}"
+USER_BATCH_SIZE="${BATCH_SIZE:-}"
+USER_TEMPERATURE="${TEMPERATURE:-}"
+USER_TOP_P="${TOP_P:-}"
+USER_DO_SAMPLE="${DO_SAMPLE:-}"
+USER_OPENAI_TIMEOUT="${OPENAI_TIMEOUT:-}"
+USER_OPENAI_MAX_RETRIES="${OPENAI_MAX_RETRIES:-}"
+USER_OPENAI_MAX_CONCURRENCY="${OPENAI_MAX_CONCURRENCY:-}"
+USER_OPENAI_STREAM="${OPENAI_STREAM:-}"
+USER_OPENAI_THINKING_MODE="${OPENAI_THINKING_MODE:-}"
+USER_REWARD_MAX_CONCURRENT="${REWARD_MAX_CONCURRENT:-}"
+USER_REWARD_TIMEOUT="${REWARD_TIMEOUT:-}"
+USER_REWARD_MAX_RETRIES="${REWARD_MAX_RETRIES:-}"
+USER_REWARD_TASK_TIMEOUT="${REWARD_TASK_TIMEOUT:-}"
+USER_REWARD_PRINT_STATUS="${REWARD_PRINT_STATUS:-}"
+USER_NUM_PERF_TRIALS="${NUM_PERF_TRIALS:-}"
+USER_NUM_CORRECT_TRIALS="${NUM_CORRECT_TRIALS:-}"
+USER_N_GPUS_PER_NODE="${N_GPUS_PER_NODE:-}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/grading_common.sh"
 
-PROJECT_NAME="kernel-grading"
-RUN_NAME="gpt-5.5-weelinking_0526"
-EXPERIMENT_NAME=${RUN_NAME}
+PROJECT_NAME="${USER_PROJECT_NAME:-kernel-grading}"
+RUN_NAME="${USER_RUN_NAME:-gpt-5.5-weelinking_0526}"
+EXPERIMENT_NAME="${USER_EXPERIMENT_NAME:-${RUN_NAME}}"
 
 REFERENCE_BACKEND="torch_compile"
 
@@ -32,7 +59,7 @@ HDFS_RUNS_PATH="/home/chen/NVS/KernelGYM_LC/drkernel/kernel/scripts/eval"
 # Use 10-row subset for small-scale testing (switch to full dataset for production)
 # EVAL_DATASET="/home/chen/NVS/KernelGYM_LC/data/drkernel-validation-data/validation_data_thinking_matmul_precision_mini10.parquet"
 # EVAL_DATASET="/home/chen/NVS/KernelGYM_LC/data/drkernel-validation-data/validation_data_thinking_matmul_precision.parquet"
-EVAL_DATASET="/home/chen/NVS/KernelGYM_LC/data/drkernel-validation-data/validation_data_thinking_matmul_precision_mini10.parquet"
+EVAL_DATASET="${USER_EVAL_DATASET:-/home/chen/NVS/KernelGYM_LC/data/drkernel-validation-data/validation_data_thinking_matmul_precision_mini10.parquet}"
 
 MULTI_TURN=True
 MAX_USER_TURNS=3
@@ -44,10 +71,10 @@ VISUALIZE_ONLY=False
 MAX_PROMPT_LENGTH=20480
 MAX_RESPONSE_LENGTH=8192
 
-OUTPUT_DIR="${HDFS_RUNS_PATH}/${RUN_NAME}"
-OUTPUT_PATH="${OUTPUT_DIR}/graded_results.parquet"
-METRICS_OUTPUT_PATH="${OUTPUT_DIR}/metrics.json"
-RAW_RESPONSE_PATH="${OUTPUT_DIR}/raw_responses.jsonl"
+OUTPUT_DIR="${USER_OUTPUT_DIR:-${HDFS_RUNS_PATH}/${RUN_NAME}}"
+OUTPUT_PATH="${USER_OUTPUT_PATH:-${OUTPUT_DIR}/graded_results.parquet}"
+METRICS_OUTPUT_PATH="${USER_METRICS_OUTPUT_PATH:-${OUTPUT_DIR}/metrics.json}"
+RAW_RESPONSE_PATH="${USER_RAW_RESPONSE_PATH:-${OUTPUT_DIR}/raw_responses.jsonl}"
 
 # --- Model path (only the tokenizer is loaded — not used for inference) ---
 ORIGINAL_MODEL="${DRKERNEL_MODEL_PATH:-/home/chen/models/drkernel-8b}"
@@ -58,11 +85,11 @@ MODEL_PATH="${HF_MODEL_PATH}"
 
 # --- Generation Parameters ---
 # For small-scale test: N_SAMPLES=1; for production: N_SAMPLES=8
-N_SAMPLES=8
-BATCH_SIZE=128
-TEMPERATURE=1.0
-TOP_P=0.95
-DO_SAMPLE=True
+N_SAMPLES="${USER_N_SAMPLES:-8}"
+BATCH_SIZE="${USER_BATCH_SIZE:-128}"
+TEMPERATURE="${USER_TEMPERATURE:-1.0}"
+TOP_P="${USER_TOP_P:-0.95}"
+DO_SAMPLE="${USER_DO_SAMPLE:-True}"
 
 # --- Rollout Mode ---
 ROLLOUT_MODE="standalone_vllm"
@@ -93,11 +120,11 @@ fi
 OPENAI_API_KEY="${ANTHROPIC_AUTH_TOKEN}"
 
 OPENAI_BASE_URL="https://api.weelinking.com/v1"
-OPENAI_TIMEOUT=400
-OPENAI_MAX_RETRIES=5
-OPENAI_MAX_CONCURRENCY=2
-OPENAI_STREAM=True
-OPENAI_THINKING_MODE=False
+OPENAI_TIMEOUT="${USER_OPENAI_TIMEOUT:-400}"
+OPENAI_MAX_RETRIES="${USER_OPENAI_MAX_RETRIES:-5}"
+OPENAI_MAX_CONCURRENCY="${USER_OPENAI_MAX_CONCURRENCY:-2}"
+OPENAI_STREAM="${USER_OPENAI_STREAM:-True}"
+OPENAI_THINKING_MODE="${USER_OPENAI_THINKING_MODE:-False}"
 
 # =============================================================================
 # Sandbox / Reward Configuration
@@ -114,13 +141,15 @@ REWARD_ENHANCED=True
 REWARD_USE_SANDBOX_RATE_LIMIT=True
 REWARD_RATE_LIMIT=64
 REWARD_ACQUIRE_TIMEOUT=2400
-REWARD_MAX_CONCURRENT=64
-REWARD_TIMEOUT=1800
-REWARD_MAX_RETRIES=3
-REWARD_TASK_TIMEOUT=1800
-REWARD_PRINT_STATUS=True
-NUM_PERF_TRIALS=10
-NUM_CORRECT_TRIALS=5
+REWARD_MAX_CONCURRENT="${USER_REWARD_MAX_CONCURRENT:-64}"
+REWARD_TIMEOUT="${USER_REWARD_TIMEOUT:-1800}"
+REWARD_MAX_RETRIES="${USER_REWARD_MAX_RETRIES:-3}"
+REWARD_TASK_TIMEOUT="${USER_REWARD_TASK_TIMEOUT:-1800}"
+REWARD_PRINT_STATUS="${USER_REWARD_PRINT_STATUS:-True}"
+NUM_PERF_TRIALS="${USER_NUM_PERF_TRIALS:-10}"
+NUM_CORRECT_TRIALS="${USER_NUM_CORRECT_TRIALS:-5}"
+ENABLE_NCU_PROFILING="${ENABLE_NCU_PROFILING:-False}"
+NCU_METRICS="${NCU_METRICS:-sm__inst_executed_pipe_fma.sum,sm__inst_executed.sum,sm__cycles_active.avg,sm__cycles_elapsed.avg,l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum,l1tex__t_sector_hit_rate.pct,smsp__warp_issue_stalled_barrier_per_warp_active.pct,smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct}"
 SPEEDUP_REWARD_UPPER_BOUND=3.0
 
 # Custom Reward Function
@@ -129,7 +158,7 @@ CUSTOM_REWARD_NAME="compute_kernel_reward_batch"
 
 NNODES=1
 # OpenAI backend does not need local GPUs — all inference is via API
-N_GPUS_PER_NODE=1
+N_GPUS_PER_NODE="${USER_N_GPUS_PER_NODE:-1}"
 
 FIX_QWEN3_CHAT_TEMPLATE=False
 
@@ -179,6 +208,8 @@ export REWARD_TASK_TIMEOUT
 export REWARD_PRINT_STATUS
 export NUM_PERF_TRIALS
 export NUM_CORRECT_TRIALS
+export ENABLE_NCU_PROFILING
+export NCU_METRICS
 export SPEEDUP_REWARD_UPPER_BOUND
 
 export CUSTOM_REWARD_PATH

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -27,6 +27,8 @@ class EvaluationTask:
     use_reference_cache: bool = False
     is_valid: bool = False
     enable_profiling: Optional[bool] = None
+    enable_ncu_profiling: Optional[bool] = None
+    ncu_metrics: Optional[List[str]] = None
     enable_triton_detection: Optional[bool] = None
     measure_performance: Optional[bool] = None
     run_correctness: Optional[bool] = None
@@ -92,6 +94,8 @@ class KernelEvaluationTask:
     entry_point: str = "Model"
     device_preference: Optional[str] = None
     enable_profiling: Optional[bool] = None
+    enable_ncu_profiling: Optional[bool] = None
+    ncu_metrics: Optional[List[str]] = None
     enable_triton_detection: Optional[bool] = None
     measure_performance: Optional[bool] = None
     run_correctness: Optional[bool] = None

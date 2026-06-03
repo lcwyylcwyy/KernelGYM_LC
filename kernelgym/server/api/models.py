@@ -52,6 +52,14 @@ class EvaluationRequest(BaseModel):
         default=None,
         description="Enable torch.profiler for this request. None=use server default, True=enable, False=disable",
     )
+    enable_ncu_profiling: Optional[bool] = Field(
+        default=None,
+        description="Enable Nsight Compute counter profiling for this request. None=use server default.",
+    )
+    ncu_metrics: Optional[List[str]] = Field(
+        default=None,
+        description="Nsight Compute metric names to collect when NCU profiling is enabled.",
+    )
     enable_triton_detection: Optional[bool] = Field(
         default=None,
         description="Enable Triton kernel usage detection (decoy check)",
@@ -130,6 +138,8 @@ class EvaluationRequest(BaseModel):
                 "is_valid": False,
                 "verbose_errors": None,
                 "enable_profiling": None,
+                "enable_ncu_profiling": None,
+                "ncu_metrics": None,
             }
         }
 

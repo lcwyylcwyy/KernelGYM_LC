@@ -77,6 +77,19 @@ def build_kernel_reward_tensors(result: dict, reward_config, valid_response_leng
     reward_extra_info["custom_kernel_cuda_time_in_profiling_us"] = custom_kernel_cuda_time_in_profiling_us
     reward_extra_info["total_kernel_run_time_in_profiling_us"] = total_kernel_run_time_in_profiling_us
 
+    metadata = result.get("metadata") if isinstance(result, dict) else None
+    if isinstance(metadata, dict) and isinstance(metadata.get("ncu"), dict):
+        reward_extra_info["ncu"] = metadata["ncu"]
+    if isinstance(result.get("ncu"), dict):
+        reward_extra_info["ncu"] = result["ncu"]
+
+    for source in (metadata, result):
+        if not isinstance(source, dict):
+            continue
+        for key, value in source.items():
+            if str(key).startswith("ncu_"):
+                reward_extra_info[key] = value
+
     time_coverage = 0.0
     if total_kernel_run_time_in_profiling_us > 0:
         time_coverage = custom_kernel_cuda_time_in_profiling_us / total_kernel_run_time_in_profiling_us

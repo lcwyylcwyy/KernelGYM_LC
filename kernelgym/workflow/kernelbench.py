@@ -82,6 +82,11 @@ class KernelBenchWorkflowController(WorkflowController):
         if enable_profiling is None:
             enable_profiling = settings.enable_profiling
         kernel_payload["enable_profiling"] = enable_profiling
+        enable_ncu_profiling = eval_task.enable_ncu_profiling
+        if enable_ncu_profiling is None:
+            enable_ncu_profiling = settings.enable_ncu_profiling
+        kernel_payload["enable_ncu_profiling"] = enable_ncu_profiling
+        kernel_payload["ncu_metrics"] = eval_task.ncu_metrics or settings.ncu_metrics
         kernel_task_spec = TaskSpec(
             kind="kernelbench.kernel",
             payload=kernel_payload,
@@ -151,6 +156,7 @@ class KernelBenchWorkflowController(WorkflowController):
                         return_reference_triton=eval_task.return_reference_triton,
                         reference_triton_max_chars=eval_task.reference_triton_max_chars,
                         device_preference=eval_task.device_preference,
+                        resources=eval_task.resources,
                     )
 
         if ref_result is None and ref_task is not None:

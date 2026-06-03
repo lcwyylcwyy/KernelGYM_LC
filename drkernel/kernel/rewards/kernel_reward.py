@@ -135,6 +135,8 @@ def compute_kernel_reward_batch(solution_strs: list, ground_truths: list, entry_
         verbose_errors = getattr(reward_config, "verbose_errors")
         detect_decoy_kernel = getattr(reward_config, "detect_decoy_kernel")
         reference_backend = getattr(reward_config, "reference_backend")
+        enable_ncu_profiling = getattr(reward_config, "enable_ncu_profiling", False)
+        ncu_metrics = getattr(reward_config, "ncu_metrics", None)
         
         for i, solution_str in enumerate(solution_strs):
             # reference_code = extract_reference_code(solution_str)
@@ -162,6 +164,8 @@ def compute_kernel_reward_batch(solution_strs: list, ground_truths: list, entry_
                 "verbose_errors": verbose_errors,
                 "detect_decoy_kernel": detect_decoy_kernel,
                 "reference_backend": reference_backend,
+                "enable_ncu_profiling": enable_ncu_profiling,
+                "ncu_metrics": ncu_metrics,
             })
         
         # 同步调用异步函数

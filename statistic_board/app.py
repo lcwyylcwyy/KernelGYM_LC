@@ -19,6 +19,7 @@ TURN_FAST_PATTERN = re.compile(r"^val/kernel/turn_(\d+)/fast@(1(?:\.0|\.2)?)_in_
 BEST_BY_TURN_FAST_PATTERN = re.compile(r"^val/kernel/best_by_turn_(\d+)/fast@(1(?:\.0|\.2)?)_in_all$")
 DEFAULT_FILTER_THRESHOLD = 1.2
 DEFAULT_FILTER_PREFIX = "best_by_turn"
+NCU_OVERVIEW_PREFIX = "val/test_score_extra/ncu_"
 
 
 def get_default_run_path() -> str:
@@ -132,7 +133,9 @@ def resolve_grading_results_path(user_input_path: str) -> Path:
     if not root.exists():
         raise FileNotFoundError(f"Path does not exist: {root}")
 
-    if root.name == "grading_results":
+    if (root / "metrics.json").exists() and (root / "eval_outputs").exists():
+        grading_results_dir = root
+    elif root.name == "grading_results":
         grading_results_dir = root
     elif (root / "grading_results").exists():
         grading_results_dir = root / "grading_results"
@@ -230,6 +233,18 @@ def extract_overview_metrics(metrics: dict[str, Any]) -> tuple[pd.DataFrame, str
             "source_key": final_correct_key,
         },
     ]
+    for key in sorted(metrics):
+        if not key.startswith(NCU_OVERVIEW_PREFIX):
+            continue
+        if key.endswith("_pass@1") or "pass@" in key:
+            continue
+        rows.append(
+            {
+                "metric": key.replace(NCU_OVERVIEW_PREFIX, "ncu/"),
+                "value": f"{_safe_float(metrics.get(key)):.6g}",
+                "source_key": key,
+            }
+        )
 
     df = pd.DataFrame(rows)
 
@@ -323,6 +338,8 @@ def build_eval_outputs_table(
         final_speedup = _safe_float(final_turn.get("performance")) if final_turn else 0.0
         best_speedup = max(turn_speedups) if turn_speedups else 0.0
         speedup_positive_any = any(bool(item.get("is_speedup_positive")) for item in turn_evals)
+        final_ncu_fma_ratio = _safe_float(final_turn.get("ncu_fma_instruction_ratio")) if final_turn else 0.0
+        final_ncu_cycle_ratio = _safe_float(final_turn.get("ncu_active_elapsed_cycle_ratio")) if final_turn else 0.0
 
         problem_id = summary.get("problem_id", final_turn.get("problem_id"))
         sample_id = summary.get("sample_id", final_turn.get("sample_id"))
@@ -352,6 +369,8 @@ def build_eval_outputs_table(
             "final_speedup": final_speedup,
             "best_speedup": best_speedup,
             "speedup_positive_any": speedup_positive_any,
+            "final_ncu_fma_instruction_ratio": final_ncu_fma_ratio,
+            "final_ncu_active_elapsed_cycle_ratio": final_ncu_cycle_ratio,
             "dialogue_log_path": str(conversation_path) if conversation_path.exists() else "",
             "sample_dir_name": sample_dir.name,
         }
@@ -379,6 +398,8 @@ def build_eval_outputs_table(
                 "final_speedup",
                 "best_speedup",
                 "speedup_positive_any",
+                "final_ncu_fma_instruction_ratio",
+                "final_ncu_active_elapsed_cycle_ratio",
                 "dialogue_log_path",
                 "sample_dir_name",
             ]
@@ -460,10 +481,14 @@ def build_eval_outputs_detail_map(
                     "speedup": _safe_float(turn_eval.get("performance")),
                     "correctness": bool(turn_eval.get("correctness", False)),
                     "compiled": bool(turn_eval.get("compilation", False)),
+                    "ncu": turn_eval.get("ncu"),
                     "kernel_code": kernel_code,
                     "response": turn_responses.get(turn_id, ""),
                 }
             )
+            for key, value in turn_eval.items():
+                if str(key).startswith("ncu_"):
+                    turn_items[-1][key] = value
 
         turn_items.sort(key=lambda item: int(item["turn_id"]))
         detail["turn_items"] = turn_items
@@ -484,6 +509,9 @@ def build_turn_metrics_summary(turn_items: list[dict[str, Any]]) -> list[dict[st
                 "compiled": item.get("compiled"),
             }
         )
+        for key, value in item.items():
+            if str(key).startswith("ncu_"):
+                summary_rows[-1][key] = value
     return summary_rows
 
 
