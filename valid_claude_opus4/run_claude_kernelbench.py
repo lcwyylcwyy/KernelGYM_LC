@@ -1017,9 +1017,12 @@ current_phase={phase}; turn={turn_id}; best_speedup_so_far={best_speedup:.4f}
 ## Required output (strict)
 {output_spec}
 ```json
-{{"phase": "explore|exploit", "phase_reason": "...", "packs": [], "next_metrics": []}}
+{{"phase": "explore|exploit", "phase_reason": "...", "untried_structural_levers": [], "packs": [], "next_metrics": []}}
 ```
-Phase rule (kernel-opt-strategy): stay `explore` while structure can still be improved or best_speedup keeps jumping >15%; switch to `exploit` only when >=2 turns gained <5% AND the kernel set is structurally optimal AND the bottleneck is implementation detail. In `exploit`, `packs` may be: {pack_names}; `next_metrics` only names present in the data above. Empty = T0 screening only. If exploitation stalls at roofline, set phase back to `explore`.
+Phase rule (kernel-opt-strategy): stay `explore` while structure can still be improved or best_speedup keeps jumping >15%.
+`untried_structural_levers` = list any NOT-yet-tried **method/structural** action your own Fixes propose — INCLUDING intra-kernel GEMM/Conv formulation swaps (`tl.dot` implicit-GEMM ↔ direct-FMA accumulation ↔ library call), operator folding, fusion, algebraic simplification. Tile/occupancy/precision micro-tuning does NOT count.
+🛑 You may set `phase: "exploit"` ONLY when `untried_structural_levers` is EMPTY **and** >=2 turns gained <5% **and** the bottleneck is pure implementation detail. If that list is non-empty, you MUST stay `explore` and the next turn must execute the top lever — intra-kernel algorithm choice (e.g. tl.dot vs FMA for a pathological K/N shape) is STRUCTURAL, not a micro-tune. (Lesson P65: a padded `tl.dot` on K=72/N=64 wasted 44% MACs; switching to it via exploit-micro-tuning capped at 1.73x while direct-FMA reaches ~5x.)
+In `exploit`, `packs` may be: {pack_names}; `next_metrics` only names present in the data above. Empty = T0 screening only. If exploitation stalls at roofline, set phase back to `explore`.
 """
 
 
@@ -1103,6 +1106,15 @@ def run_strategy_analysis(
     next_phase = str(decision.get("phase") or phase).strip().lower()
     if next_phase not in {"explore", "exploit"}:
         next_phase = phase
+    # Guardrail (P65 lesson): never let the run leave EXPLORE while the analysis
+    # itself still lists untried method/structural levers (incl. intra-kernel
+    # GEMM-formulation swaps tl.dot<->FMA<->lib). Premature exploit micro-tunes
+    # the wrong kernel form and caps speedup.
+    untried = [str(x) for x in (decision.get("untried_structural_levers") or []) if str(x).strip()]
+    forced = False
+    if untried and next_phase == "exploit":
+        next_phase = "explore"
+        forced = True
     packs = [str(p) for p in (decision.get("packs") or [])]
     next_metrics = [str(m) for m in (decision.get("next_metrics") or [])]
     (analysis_dir / f"{item.key}_turn_{turn_id}_report.md").write_text(
@@ -1111,6 +1123,14 @@ def run_strategy_analysis(
     meta = {f"analysis_{k}": v for k, v in info.items()}
     meta["analysis_phase"] = phase
     meta["analysis_next_phase"] = next_phase
+    meta["analysis_untried_structural_levers"] = untried
+    if forced:
+        meta["analysis_phase_forced_explore"] = True
+        print(
+            f"[strategy] {item.key} turn {turn_id}: forced explore (untried "
+            f"structural levers: {untried})",
+            flush=True,
+        )
     return report, next_phase, next_metrics, packs, meta
 
 

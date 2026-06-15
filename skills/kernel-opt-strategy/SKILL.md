@@ -82,11 +82,17 @@ description: KernelBench Triton 优化的两阶段策略编排。阶段1（方�
 ### 方法稳定判据 → 转入阶段 2（调优）
 **同时**满足才切换：
 1. 最近 **≥2 轮 best speedup 提升 < 5%**（方法收益见顶）
-2. 当前 kernel 已是**结构最优**：没有明显可融合的 round-trip、没有可化简的冗余计算、没有可折叠的算子
-3. 主 kernel 的瓶颈是**实现细节**（tile 不对、occupancy 低、访存不连续、精度可降），而非**算法/结构**
+2. 当前 kernel 已是**结构最优**——含两层，缺一不可：
+   - **(a) 分解最优**：没有明显可融合的 round-trip、没有可化简的冗余计算、没有可折叠的算子
+   - **(b) 核内算法最优**：主 kernel 内部的**算法形式**也已选对——GEMM/Conv 的实现路线（`tl.dot` implicit-GEMM vs direct-FMA 累加 vs 库调用）对**本题 shape** 是最优的，没有"换一种核内算法可能更快"的未试选项
+3. 主 kernel 的瓶颈是**实现细节**（tile 不对、occupancy 低、访存不连续），而非**算法/结构**（含核内算法形式）
+
+> 🛑 **硬规则：只要本轮 explore 分析的 Fixes 里还挂着任何"方法/结构"级动作（含核内 GEMM/Conv 形式切换 `tl.dot`↔FMA↔库、算子折叠、融合、算法化简），就 NOT 满足判据 2 → 留在 explore 把它执行掉，禁止切 exploit。** "结构最优"= Fixes 里只剩 tile/occupancy/精度这类微调动作。
+>
+> 实测教训（P65 Conv2d_HardSwish_ReLU）：模型写了 implicit-GEMM `tl.dot`，但 `K=C_in·KH·KW=72` pad 到 128 浪费 44% MAC、`N=64` 喂不饱 TC。explore 分析**自己开出 Fix 1 = 换 direct-FMA 累加**，但相位机误判"分解已最优"切了 exploit，去微调那个低效 tl.dot → 卡 1.73x（GPT-5.5 用 direct-FMA 拿 4.95x）。**核内 GEMM 形式选择被当成"实现细节"漏掉了——它是结构级动作。**
 
 ### 阶段 2 内的回退（探索复活）
-若 NCU 调优 **≥2 轮无进展**，且报告里出现"already autotuned / at roofline / 只能减流量"——说明当前方法已到极限。**回到阶段 1**，质疑结构本身：这个 kernel 能不能被另一种方法整个替换掉？（p7 教训：NCU 说"conv 是黑盒只能调 dtype"，但正解是把 conv 换成自写融合 kernel。）
+若 NCU 调优 **≥2 轮无进展**，且报告里出现"already autotuned / at roofline / 只能减流量"——说明当前方法已到极限。**回到阶段 1**，质疑结构本身：这个 kernel 能不能被另一种方法整个替换掉、核内 GEMM 形式能不能换（tl.dot↔FMA↔库）？（p7 教训：NCU 说"conv 是黑盒只能调 dtype"，但正解是把 conv 换成自写融合 kernel。）
 
 ---
 
