@@ -160,6 +160,35 @@ def score_from_eval(eval_result: dict[str, Any]) -> float:
     return round(speedup, 6)
 
 
+# drkernel reward (calculate_reward_speedup): selection metric for STTS history,
+# matching drkernel-14b's best-K selection. reward = init_correct_weight*correct
+# + init_performance_weight*min(speedup, upper_bound). speedup is capped, so any
+# correct turn >= upper_bound speedup ties — selection then favors correctness +
+# the cap, NOT raw speedup (35x and 3x are equal-reward). Failed/decoy => penalty.
+STTS_REWARD_CORRECT_WEIGHT = float(os.getenv("KG_REWARD_CORRECT_WEIGHT", "0.5"))
+STTS_REWARD_PERF_WEIGHT = float(os.getenv("KG_REWARD_PERF_WEIGHT", "0.5"))
+STTS_REWARD_SPEEDUP_UPPER = float(os.getenv("KG_REWARD_SPEEDUP_UPPER", "3.0"))
+STTS_REWARD_SPEEDUP_LOWER = float(os.getenv("KG_REWARD_SPEEDUP_LOWER", "0.0"))
+
+
+def reward_from_eval(eval_result: dict[str, Any]) -> float:
+    """drkernel-aligned reward used as the STTS best-K selection metric."""
+    if eval_result.get("decoy_kernel") is True:
+        return 0.0
+    if eval_result.get("correctness") is not True:
+        return 0.0
+    speedup = _as_float(eval_result.get("speedup")) or 0.0
+    reward_speedup = min(speedup, STTS_REWARD_SPEEDUP_UPPER)
+    if reward_speedup < STTS_REWARD_SPEEDUP_LOWER:
+        reward_speedup = 0.0
+    correctness = 1.0  # already gated to correct above
+    return round(
+        STTS_REWARD_CORRECT_WEIGHT * correctness
+        + STTS_REWARD_PERF_WEIGHT * reward_speedup,
+        6,
+    )
+
+
 def drkernel_turn_metrics(eval_result: dict[str, Any]) -> dict[str, str]:
     metadata = eval_result.get("metadata") or {}
     compiled = _first_present(
@@ -628,14 +657,22 @@ def conversation_text(item: WorkItem, turns: list[dict[str, Any]]) -> str:
     return "\n".join(parts).rstrip() + "\n"
 
 
+def _turn_reward(t: dict[str, Any]) -> float:
+    """STTS selection key: drkernel reward if present, else fall back to score."""
+    r = t.get("reward")
+    if r is not None:
+        return float(r)
+    return float(t.get("score") or 0.0)
+
+
 def select_stts_history(
     turns: list[dict[str, Any]], top_k: int
 ) -> list[dict[str, Any]]:
-    """Pick the top_k highest-scoring turns (ties favour later turns), returned
-    in chronological order for STTS prompt construction."""
+    """Pick the top_k highest-REWARD turns (drkernel best-K; ties favour later
+    turns), returned in chronological order for STTS prompt construction."""
     ranked = sorted(
         turns,
-        key=lambda t: (float(t.get("score") or 0.0), int(t.get("turn_id") or 0)),
+        key=lambda t: (_turn_reward(t), int(t.get("turn_id") or 0)),
         reverse=True,
     )[:top_k]
     return sorted(ranked, key=lambda t: int(t.get("turn_id") or 0))
@@ -648,15 +685,18 @@ def stts_note_text(
     all_turns: list[dict[str, Any]],
     selected: list[dict[str, Any]],
 ) -> str:
-    best = max((float(t.get("score") or 0.0) for t in all_turns), default=0.0)
+    best_reward = max((_turn_reward(t) for t in all_turns), default=0.0)
+    best_speedup = max((float(t.get("score") or 0.0) for t in all_turns), default=0.0)
     shown = ", ".join(str(t.get("turn_id")) for t in selected)
     return (
         f"Note: this is turn {turn_id} of {total_turns}. You have made "
         f"{len(all_turns)} previous attempts; only your {len(selected)} "
-        f"best-scoring attempts (turns {shown}; score = speedup if correct, "
-        f"else 0) are shown above, in chronological order. The best score so "
-        f"far is {best:.4f}. Analyze why the best attempts performed well and "
-        "produce a new implementation that beats the best score."
+        f"best-reward attempts (turns {shown}; reward = 0.5*correct + "
+        f"0.5*min(speedup,3.0), i.e. correctness matters and speedup is capped "
+        f"at 3x) are shown above, in chronological order. Best reward so far "
+        f"{best_reward:.4f} (best speedup {best_speedup:.4f}). Analyze why the "
+        "best attempts performed well and produce a new implementation that "
+        "beats them."
     )
 
 
@@ -1614,6 +1654,7 @@ def process_one(
                 )
             metrics = drkernel_turn_metrics(eval_result)
             score = score_from_eval(eval_result)
+            reward = reward_from_eval(eval_result)
             ncu_report = None
             if use_strategy:
                 meta_d = eval_result.get("metadata") or {}
@@ -1705,6 +1746,7 @@ def process_one(
                 "optimization_notes": optimization_notes,
                 "kernel_code": kernel_code,
                 "score": score,
+                "reward": reward,
                 "ncu_report": ncu_report,
                 "phase": phase if use_strategy else None,
                 "metrics": metrics,
