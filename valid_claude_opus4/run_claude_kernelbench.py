@@ -665,17 +665,40 @@ def _turn_reward(t: dict[str, Any]) -> float:
     return float(t.get("score") or 0.0)
 
 
+# Mode B (default): keep drkernel reward ranking for the window BUT always retain
+# the single highest-SPEEDUP correct turn, so the reward cap (3.0) can never evict
+# an algorithmic high-speedup solution (35x/154x) from the explore window. Set
+# KG_STTS_KEEP_BEST_SPEEDUP=0 for pure drkernel reward selection (mode A).
+STTS_KEEP_BEST_SPEEDUP = os.getenv("KG_STTS_KEEP_BEST_SPEEDUP", "1") == "1"
+
+
 def select_stts_history(
     turns: list[dict[str, Any]], top_k: int
 ) -> list[dict[str, Any]]:
-    """Pick the top_k highest-REWARD turns (drkernel best-K; ties favour later
-    turns), returned in chronological order for STTS prompt construction."""
-    ranked = sorted(
+    """Pick top_k turns for the STTS window: by drkernel REWARD, but (mode B)
+    always include the single highest-speedup correct turn so a capped-reward tie
+    cannot drop the best algorithmic solution. Returned in chronological order."""
+    if top_k <= 0 or not turns:
+        return sorted(turns, key=lambda t: int(t.get("turn_id") or 0))
+
+    def by_reward(seq: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return sorted(
+            seq,
+            key=lambda t: (_turn_reward(t), int(t.get("turn_id") or 0)),
+            reverse=True,
+        )
+
+    best_sp = max(
         turns,
-        key=lambda t: (_turn_reward(t), int(t.get("turn_id") or 0)),
-        reverse=True,
-    )[:top_k]
-    return sorted(ranked, key=lambda t: int(t.get("turn_id") or 0))
+        key=lambda t: (float(t.get("score") or 0.0), int(t.get("turn_id") or 0)),
+    )
+    if STTS_KEEP_BEST_SPEEDUP and float(best_sp.get("score") or 0.0) > 0.0:
+        # reserve one slot for the best-speedup turn; fill the rest by reward
+        rest = by_reward([t for t in turns if t is not best_sp])[: top_k - 1]
+        selected = [best_sp, *rest]
+    else:
+        selected = by_reward(turns)[:top_k]
+    return sorted(selected, key=lambda t: int(t.get("turn_id") or 0))
 
 
 def stts_note_text(
@@ -690,13 +713,13 @@ def stts_note_text(
     shown = ", ".join(str(t.get("turn_id")) for t in selected)
     return (
         f"Note: this is turn {turn_id} of {total_turns}. You have made "
-        f"{len(all_turns)} previous attempts; only your {len(selected)} "
-        f"best-reward attempts (turns {shown}; reward = 0.5*correct + "
-        f"0.5*min(speedup,3.0), i.e. correctness matters and speedup is capped "
-        f"at 3x) are shown above, in chronological order. Best reward so far "
-        f"{best_reward:.4f} (best speedup {best_speedup:.4f}). Analyze why the "
-        "best attempts performed well and produce a new implementation that "
-        "beats them."
+        f"{len(all_turns)} previous attempts; the {len(selected)} shown above "
+        f"(turns {shown}, chronological) are your best by reward = 0.5*correct + "
+        f"0.5*min(speedup,3.0), PLUS your single highest-speedup attempt is "
+        f"always kept. Best speedup so far {best_speedup:.4f} (reward "
+        f"{best_reward:.4f}). The reward caps speedup at 3x, but raw speedup is "
+        "what ultimately matters — study the highest-speedup attempt's approach "
+        "and produce a new implementation that beats its raw speedup."
     )
 
 
