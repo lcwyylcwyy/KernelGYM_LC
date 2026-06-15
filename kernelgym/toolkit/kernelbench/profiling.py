@@ -8,6 +8,7 @@ import csv
 import io
 import json
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -376,6 +377,105 @@ def _excerpt(text: str, max_chars: int = 4000) -> str:
     return text[: max_chars // 2] + "\n... [truncated] ...\n" + text[-max_chars // 2 :]
 
 
+def _kill_process_group(proc: "subprocess.Popen") -> None:
+    """SIGKILL the entire process group of proc. ncu/nsys spawn their own GPU
+    worker grandchildren (run_ncu_target.py); a plain proc.kill() leaves those
+    alive as orphans that keep holding the GPU and CONTAMINATE concurrent timing.
+    proc was started with start_new_session=True, so it is a group leader and its
+    pgid == its pid — kill that group DIRECTLY (do NOT call os.getpgid first: if
+    the leader was already reaped, getpgid raises and a backgrounded grandchild
+    would survive). killpg(pid) still reaches surviving group members even after
+    the leader exits."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    if proc.poll() is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+
+
+_ORPHAN_PROFILER_NEEDLES = (
+    "run_ncu_target",
+    "kgym_ncu_",
+    "kgym_nsys_",
+    "nsight-compute",
+    "nsight-systems",
+)
+
+
+def _reap_orphan_profilers() -> int:
+    """Kill ORPHANED (reparented to init, PPid==1) ncu/nsys profiler processes
+    left behind by a worker that was SIGKILLed mid-profiling (so its in-process
+    cleanup never ran). Called at the start of every profiling run as a safety
+    net. SAFE for multi-GPU/multi-worker: a legitimate concurrent profiler owned
+    by a live worker has PPid != 1 and is never touched."""
+    killed = 0
+    try:
+        pids = os.listdir("/proc")
+    except OSError:
+        return 0
+    for pid_dir in pids:
+        if not pid_dir.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid_dir}/cmdline", "rb") as fh:
+                cmdline = fh.read().replace(b"\x00", b" ").decode("utf-8", "ignore")
+            if not any(n in cmdline for n in _ORPHAN_PROFILER_NEEDLES):
+                continue
+            ppid = 0
+            with open(f"/proc/{pid_dir}/status") as fh:
+                for line in fh:
+                    if line.startswith("PPid:"):
+                        ppid = int(line.split()[1])
+                        break
+            if ppid == 1:
+                os.kill(int(pid_dir), signal.SIGKILL)
+                killed += 1
+        except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError):
+            continue
+    if killed:
+        logger.warning("reaped %d orphaned profiler process(es) before profiling", killed)
+    return killed
+
+
+def _run_capture_killgroup(
+    cmd: Sequence[str],
+    *,
+    env: Dict[str, str],
+    timeout_sec: float,
+    cwd: Optional[str] = None,
+) -> subprocess.CompletedProcess:
+    """Run cmd capturing stdout/stderr in its OWN process group, GUARANTEEING the
+    whole group (incl. ncu/nsys GPU worker grandchildren) is killed on timeout or
+    exit — so a profiler can never leave an orphan hogging the GPU. Raises
+    subprocess.TimeoutExpired (after the group is reaped) on timeout."""
+    proc = subprocess.Popen(
+        list(cmd),
+        cwd=cwd or os.getcwd(),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,  # own session/pgid => killpg reaps all descendants
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout_sec)
+        return subprocess.CompletedProcess(list(cmd), proc.returncode, out, err)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc)
+        try:
+            proc.communicate(timeout=10)
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+    finally:
+        # belt-and-suspenders: reap any descendant that outlived the main process
+        _kill_process_group(proc)
+
+
 def run_ncu_profiling(
     *,
     original_model_src: str,
@@ -389,6 +489,7 @@ def run_ncu_profiling(
     timeout_sec: int = 300,
 ) -> Dict[str, Any]:
     """Run Nsight Compute in a child Python process and parse raw CSV output."""
+    _reap_orphan_profilers()
     metric_list = normalize_ncu_metrics(metrics)
     ncu_path = shutil.which("ncu")
     if not ncu_path:
@@ -433,14 +534,8 @@ def run_ncu_profiling(
         else:
             env["PYTHONPATH"] = repo_root
         try:
-            completed = subprocess.run(
-                cmd,
-                cwd=os.getcwd(),
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=timeout_sec,
-                check=False,
+            completed = _run_capture_killgroup(
+                cmd, env=env, timeout_sec=timeout_sec
             )
         except Exception as exc:
             return {
@@ -597,6 +692,7 @@ def run_nsys_profiling(
     kernel internals. Cheap (one near-native pass, no replay), so it can run
     every turn. Returns a compact summary plus the raw per-report rows.
     """
+    _reap_orphan_profilers()
     nsys_path = shutil.which("nsys")
     if not nsys_path:
         return {"status": "failed", "summary": {}, "error": "nsys not found on PATH"}
@@ -643,14 +739,8 @@ def run_nsys_profiling(
             str(num_trials),
         ]
         try:
-            prof = subprocess.run(
-                profile_cmd,
-                cwd=os.getcwd(),
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=timeout_sec,
-                check=False,
+            prof = _run_capture_killgroup(
+                profile_cmd, env=env, timeout_sec=timeout_sec
             )
         except Exception as exc:  # noqa: BLE001
             return {"status": "failed", "summary": {}, "error": str(exc)}
@@ -670,7 +760,7 @@ def run_nsys_profiling(
         stats_by_report: Dict[str, List[Dict[str, Any]]] = {}
         for report in NSYS_REPORTS:
             try:
-                stats = subprocess.run(
+                stats = _run_capture_killgroup(
                     [
                         nsys_path,
                         "stats",
@@ -682,12 +772,8 @@ def run_nsys_profiling(
                         "true",
                         str(rep_file),
                     ],
-                    cwd=os.getcwd(),
                     env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout_sec,
-                    check=False,
+                    timeout_sec=timeout_sec,
                 )
             except Exception:  # noqa: BLE001
                 continue
