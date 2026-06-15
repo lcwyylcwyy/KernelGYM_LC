@@ -90,6 +90,11 @@ class Settings(BaseSettings):
         env="ENABLE_NCU_PROFILING",
         description="Enable opt-in Nsight Compute counter profiling after normal timing.",
     )
+    enable_nsys_profiling: bool = Field(
+        default=False,
+        env="ENABLE_NSYS_PROFILING",
+        description="Enable opt-in Nsight Systems timeline profiling (kernel count / launch overhead / memcpy) after normal timing.",
+    )
     ncu_metrics: List[str] = Field(
         default_factory=lambda: list(DEFAULT_NCU_METRICS),
         env="NCU_METRICS",

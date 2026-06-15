@@ -87,6 +87,10 @@ class KernelBenchWorkflowController(WorkflowController):
             enable_ncu_profiling = settings.enable_ncu_profiling
         kernel_payload["enable_ncu_profiling"] = enable_ncu_profiling
         kernel_payload["ncu_metrics"] = eval_task.ncu_metrics or settings.ncu_metrics
+        enable_nsys_profiling = getattr(eval_task, "enable_nsys_profiling", None)
+        if enable_nsys_profiling is None:
+            enable_nsys_profiling = getattr(settings, "enable_nsys_profiling", False)
+        kernel_payload["enable_nsys_profiling"] = enable_nsys_profiling
         kernel_task_spec = TaskSpec(
             kind="kernelbench.kernel",
             payload=kernel_payload,

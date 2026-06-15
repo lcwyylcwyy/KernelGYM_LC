@@ -24,6 +24,7 @@ from kernelgym.toolkit.kernelbench.correctness import run_and_check_correctness
 from kernelgym.toolkit.kernelbench.profiling import (
     compute_triton_kernel_coverage,
     run_ncu_profiling,
+    run_nsys_profiling,
 )
 from kernelgym.toolkit.kernelbench.timing import (
     get_timing_stats,
@@ -287,6 +288,7 @@ def _run_performance_step(
     enable_profiling: bool,
     enable_ncu_profiling: bool,
     ncu_metrics: Optional[list[str]],
+    enable_nsys_profiling: bool = False,
 ):
     def _profiling_empty(metrics: Dict[str, Any]) -> bool:
         if not metrics:
@@ -510,6 +512,22 @@ def _run_performance_step(
                     kernel_exec_result.metadata["ncu"] = ncu_result
                     for key, value in (ncu_result.get("scalars") or {}).items():
                         kernel_exec_result.metadata[key] = value
+
+            if enable_nsys_profiling:
+                print("[NSYS] Running Nsight Systems timeline profiling...")
+                nsys_result = run_nsys_profiling(
+                    original_model_src=original_model_src,
+                    custom_model_src=custom_model_src,
+                    entry_point=entry_point,
+                    device=device,
+                    seed_num=seed_num,
+                    num_warmup=3,
+                    num_trials=max(5, min(20, num_perf_trials)),
+                    timeout_sec=max(120, min(600, num_perf_trials * 30)),
+                )
+                metadata["nsys"] = nsys_result
+                if kernel_exec_result and isinstance(kernel_exec_result.metadata, dict):
+                    kernel_exec_result.metadata["nsys"] = nsys_result
     except Exception as e:
         if verbose:
             print(f"[Eval] Error in Measuring Performance: {e}")
@@ -532,6 +550,7 @@ def eval_kernel_against_ref(
     enable_profiling: bool = True,
     enable_ncu_profiling: bool = False,
     ncu_metrics: Optional[list[str]] = None,
+    enable_nsys_profiling: bool = False,
     enable_triton_detection: bool = True,
     backend_adapter: Optional[Any] = None,
 ) -> KernelExecResult:
@@ -742,6 +761,7 @@ def eval_kernel_against_ref(
             enable_profiling=enable_profiling,
             enable_ncu_profiling=enable_ncu_profiling,
             ncu_metrics=ncu_metrics,
+            enable_nsys_profiling=enable_nsys_profiling,
         )
 
     _cleanup()

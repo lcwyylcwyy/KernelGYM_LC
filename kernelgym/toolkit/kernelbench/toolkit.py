@@ -68,6 +68,10 @@ class KernelBenchToolkit(Toolkit):
                     "enable_ncu_profiling",
                     settings.enable_ncu_profiling,
                 ),
+                enable_nsys_profiling=task.get(
+                    "enable_nsys_profiling",
+                    getattr(settings, "enable_nsys_profiling", False),
+                ),
                 backend_adapter=backend,
             )
         else:
@@ -123,6 +127,11 @@ class KernelBenchToolkit(Toolkit):
             enable_ncu_profiling = task.enable_ncu_profiling
             if enable_ncu_profiling is None:
                 enable_ncu_profiling = settings.enable_ncu_profiling
+            enable_nsys_profiling = getattr(task, "enable_nsys_profiling", None)
+            if enable_nsys_profiling is None:
+                enable_nsys_profiling = getattr(
+                    settings, "enable_nsys_profiling", False
+                )
 
             result = kernelbench_pipeline.eval_kernel_against_ref(
                 original_model_src=task.reference_code,
@@ -137,6 +146,7 @@ class KernelBenchToolkit(Toolkit):
                 enable_profiling=bool(enable_profiling),
                 enable_ncu_profiling=bool(enable_ncu_profiling),
                 ncu_metrics=task.ncu_metrics or settings.ncu_metrics,
+                enable_nsys_profiling=bool(enable_nsys_profiling),
                 enable_triton_detection=enable_triton_detection,
                 backend_adapter=backend_adapter,
             )
@@ -262,6 +272,7 @@ class KernelBenchToolkit(Toolkit):
         verbose_errors: bool = True,
         enable_profiling: bool = False,
         enable_ncu_profiling: bool = False,
+        enable_nsys_profiling: bool = False,
         backend_adapter=None,
     ) -> KernelEvaluationResult:
         device = torch.device(task.device)
@@ -316,6 +327,11 @@ class KernelBenchToolkit(Toolkit):
                 enable_profiling=enable_profiling,
                 enable_ncu_profiling=bool(enable_ncu_profiling),
                 ncu_metrics=task.ncu_metrics or settings.ncu_metrics,
+                enable_nsys_profiling=bool(
+                    enable_nsys_profiling
+                    if enable_nsys_profiling
+                    else getattr(task, "enable_nsys_profiling", None)
+                ),
                 enable_triton_detection=enable_triton_detection,
                 backend_adapter=backend_adapter,
             )

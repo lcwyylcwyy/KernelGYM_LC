@@ -29,6 +29,7 @@ class EvaluationTask:
     enable_profiling: Optional[bool] = None
     enable_ncu_profiling: Optional[bool] = None
     ncu_metrics: Optional[List[str]] = None
+    enable_nsys_profiling: Optional[bool] = None
     enable_triton_detection: Optional[bool] = None
     measure_performance: Optional[bool] = None
     run_correctness: Optional[bool] = None
@@ -96,6 +97,7 @@ class KernelEvaluationTask:
     enable_profiling: Optional[bool] = None
     enable_ncu_profiling: Optional[bool] = None
     ncu_metrics: Optional[List[str]] = None
+    enable_nsys_profiling: Optional[bool] = None
     enable_triton_detection: Optional[bool] = None
     measure_performance: Optional[bool] = None
     run_correctness: Optional[bool] = None

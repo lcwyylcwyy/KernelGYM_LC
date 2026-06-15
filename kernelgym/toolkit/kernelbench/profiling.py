@@ -460,6 +460,247 @@ def run_ncu_profiling(
     return parsed
 
 
+# Nsight Systems reports relevant to KernelBench Level-2 (system / inter-kernel
+# / timeline dimension): kernel summary (count + hotspots), launch+exec time
+# (launch overhead / queue), and GPU memory ops (layout copies / H2D-D2H).
+NSYS_REPORTS = (
+    "cuda_gpu_kern_sum",
+    "cuda_kern_exec_sum",
+    "cuda_gpu_mem_time_sum",
+    "cuda_api_sum",
+)
+
+
+def _nsys_float(text: str) -> Optional[float]:
+    text = (text or "").strip().replace(",", "")
+    if not text or text in {"-", "N/A"}:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _parse_nsys_csv_report(text: str) -> List[Dict[str, Any]]:
+    """Parse one `nsys stats --format csv` report block into a list of row dicts
+    (numeric cells coerced to float). nsys emits a comment header line starting
+    with '** <report name>' before the CSV header — skip non-CSV preamble."""
+    lines = [ln for ln in (text or "").splitlines() if ln.strip()]
+    start = None
+    for i, ln in enumerate(lines):
+        # the CSV header row contains commas and no leading '**'
+        if not ln.lstrip().startswith("**") and "," in ln:
+            start = i
+            break
+    if start is None:
+        return []
+    rows: List[Dict[str, Any]] = []
+    reader = csv.reader(lines[start:])
+    header = next(reader, None)
+    if not header:
+        return []
+    for cells in reader:
+        if len(cells) < len(header):
+            continue
+        row: Dict[str, Any] = {}
+        for key, val in zip(header, cells):
+            num = _nsys_float(val)
+            row[key.strip()] = num if num is not None else val.strip()
+        rows.append(row)
+    return rows
+
+
+def _summarize_nsys(stats_by_report: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+    """Condense raw nsys report rows into the timeline-level signals the
+    diagnosis skill cares about: kernel count, hotspot table, launch overhead,
+    memcpy traffic."""
+    summary: Dict[str, Any] = {}
+    kern = stats_by_report.get("cuda_gpu_kern_sum") or []
+
+    def _pick(row: Dict[str, Any], *names: str) -> Any:
+        for n in names:
+            for key in row:
+                if key.lower().startswith(n.lower()):
+                    return row[key]
+        return None
+
+    hot = []
+    total_kernel_ns = 0.0
+    for r in kern:
+        t = _pick(r, "Total Time", "Total")
+        inst = _pick(r, "Instances", "Count")
+        name = _pick(r, "Name")
+        if isinstance(t, (int, float)):
+            total_kernel_ns += t
+        hot.append(
+            {
+                "name": str(name)[:100] if name else "?",
+                "total_ns": t,
+                "instances": inst,
+                "avg_ns": _pick(r, "Avg"),
+                "pct": _pick(r, "Time (%)", "Time%", "%"),
+            }
+        )
+    summary["num_distinct_kernels"] = len(kern)
+    summary["total_kernel_time_ns"] = round(total_kernel_ns, 1) if total_kernel_ns else None
+    summary["top_kernels"] = hot[:12]
+
+    mem = stats_by_report.get("cuda_gpu_mem_time_sum") or []
+    mem_rows = []
+    total_mem_ns = 0.0
+    for r in mem:
+        t = _pick(r, "Total Time", "Total")
+        if isinstance(t, (int, float)):
+            total_mem_ns += t
+        mem_rows.append(
+            {
+                "op": str(_pick(r, "Operation", "Name"))[:60],
+                "total_ns": t,
+                "count": _pick(r, "Count", "Instances"),
+            }
+        )
+    summary["mem_ops"] = mem_rows[:8]
+    summary["total_memops_time_ns"] = round(total_mem_ns, 1) if total_mem_ns else None
+
+    api = stats_by_report.get("cuda_api_sum") or []
+    launch_ns = 0.0
+    sync_ns = 0.0
+    for r in api:
+        name = str(_pick(r, "Name") or "")
+        t = _pick(r, "Total Time", "Total")
+        if not isinstance(t, (int, float)):
+            continue
+        if "LaunchKernel" in name:
+            launch_ns += t
+        if "Synchronize" in name:
+            sync_ns += t
+    summary["cuda_launch_api_ns"] = round(launch_ns, 1) if launch_ns else None
+    summary["cuda_sync_api_ns"] = round(sync_ns, 1) if sync_ns else None
+    return summary
+
+
+def run_nsys_profiling(
+    *,
+    original_model_src: str,
+    custom_model_src: str,
+    entry_point: str,
+    device: Union[torch.device, int, str, None],
+    seed_num: int = 42,
+    num_warmup: int = 3,
+    num_trials: int = 10,
+    timeout_sec: int = 300,
+) -> Dict[str, Any]:
+    """Run Nsight Systems on a child Python process and parse the timeline
+    summary (kernel count, hotspots, launch overhead, memcpy traffic).
+
+    This is the system / inter-kernel dimension — orthogonal to NCU's single
+    kernel internals. Cheap (one near-native pass, no replay), so it can run
+    every turn. Returns a compact summary plus the raw per-report rows.
+    """
+    nsys_path = shutil.which("nsys")
+    if not nsys_path:
+        return {"status": "failed", "summary": {}, "error": "nsys not found on PATH"}
+
+    with tempfile.TemporaryDirectory(prefix="kgym_nsys_") as temp_dir:
+        temp_path = Path(temp_dir)
+        reference_path = temp_path / "reference.py"
+        kernel_path = temp_path / "kernel.py"
+        script_path = temp_path / "run_ncu_target.py"
+        rep_path = temp_path / "report"
+        reference_path.write_text(original_model_src, encoding="utf-8")
+        kernel_path.write_text(custom_model_src, encoding="utf-8")
+        _write_ncu_driver_script(script_path)
+
+        env = os.environ.copy()
+        repo_root = str(Path(__file__).resolve().parents[3])
+        env["PYTHONPATH"] = (
+            os.pathsep.join([repo_root, env["PYTHONPATH"]])
+            if env.get("PYTHONPATH")
+            else repo_root
+        )
+
+        profile_cmd = [
+            nsys_path,
+            "profile",
+            "--force-overwrite",
+            "true",
+            "-o",
+            str(rep_path),
+            "--trace",
+            "cuda",
+            "--sample",
+            "none",
+            "--cpuctxsw",
+            "none",
+            sys.executable,
+            str(script_path),
+            str(reference_path),
+            str(kernel_path),
+            entry_point,
+            _device_arg(device),
+            str(seed_num),
+            str(num_warmup),
+            str(num_trials),
+        ]
+        try:
+            prof = subprocess.run(
+                profile_cmd,
+                cwd=os.getcwd(),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+                check=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"status": "failed", "summary": {}, "error": str(exc)}
+
+        rep_file = rep_path.with_suffix(".nsys-rep")
+        if not rep_file.exists():
+            alt = list(temp_path.glob("report*.nsys-rep"))
+            rep_file = alt[0] if alt else rep_file
+        if not rep_file.exists():
+            return {
+                "status": "failed",
+                "summary": {},
+                "error": "nsys produced no report",
+                "stderr": _excerpt(prof.stderr or prof.stdout),
+            }
+
+        stats_by_report: Dict[str, List[Dict[str, Any]]] = {}
+        for report in NSYS_REPORTS:
+            try:
+                stats = subprocess.run(
+                    [
+                        nsys_path,
+                        "stats",
+                        "--report",
+                        report,
+                        "--format",
+                        "csv",
+                        "--force-export",
+                        "true",
+                        str(rep_file),
+                    ],
+                    cwd=os.getcwd(),
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_sec,
+                    check=False,
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            stats_by_report[report] = _parse_nsys_csv_report(stats.stdout)
+
+    summary = _summarize_nsys(stats_by_report)
+    return {
+        "status": "ok" if summary.get("num_distinct_kernels") else "empty",
+        "summary": summary,
+        "reports": {k: v[:20] for k, v in stats_by_report.items()},
+    }
+
+
 def compute_triton_kernel_coverage(matched_triton_kernels: List[str], profilling_result: Dict[str, Any]):
     """Compute the coverage of the matched triton kernels in the profiling result."""
 

@@ -60,6 +60,10 @@ class EvaluationRequest(BaseModel):
         default=None,
         description="Nsight Compute metric names to collect when NCU profiling is enabled.",
     )
+    enable_nsys_profiling: Optional[bool] = Field(
+        default=None,
+        description="Enable Nsight Systems timeline profiling (kernel count / launch overhead / memcpy). None=use server default.",
+    )
     enable_triton_detection: Optional[bool] = Field(
         default=None,
         description="Enable Triton kernel usage detection (decoy check)",
