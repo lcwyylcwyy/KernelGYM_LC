@@ -120,6 +120,11 @@ def parse_args() -> argparse.Namespace:
         help="hierarchical NCU profiling + skill-driven analysis feedback",
     )
     p.add_argument(
+        "--gen-effort",
+        default=_env("KG_GEN_EFFORT", "high"),
+        help="effort level for the kernel-generation claude call (default high)",
+    )
+    p.add_argument(
         "--analysis-effort",
         default=_env("KG_ANALYSIS_EFFORT", "high"),
         help="effort level for the analysis claude call",

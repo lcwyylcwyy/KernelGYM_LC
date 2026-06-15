@@ -1291,6 +1291,7 @@ def run_claude(
     timeout_sec: int,
     turn_id: int,
     prompt: str,
+    effort: str = "high",
 ) -> tuple[str, dict[str, Any]]:
     prompts_dir = output_dir / "prompts"
     raw_dir = output_dir / "raw_responses"
@@ -1311,7 +1312,7 @@ def run_claude(
         "--model",
         model,
         "--effort",
-        "max",
+        effort,
         "--no-session-persistence",
         "--dangerously-skip-permissions",
         "--output-format",
@@ -1642,6 +1643,7 @@ def process_one(
                     timeout_sec=args.claude_timeout,
                     turn_id=turn_id,
                     prompt=prompt,
+                    effort=str(getattr(args, "gen_effort", "high") or "high"),
                 )
                 raw_text = str(turn_claude_meta.get("raw_response") or "")
             optimization_notes = str(
@@ -1906,6 +1908,12 @@ def parse_args() -> argparse.Namespace:
         "full skill metric space on the first turn, then let the analysis LLM "
         "(gpu-kernel-diag skill) pick next-turn metrics; diagnosis report is "
         "appended to the generation feedback",
+    )
+    parser.add_argument(
+        "--gen-effort",
+        default="high",
+        help="effort level for the kernel-generation claude call (default: high; "
+        "'max' is deepest but ~2-3x slower/costlier)",
     )
     parser.add_argument(
         "--analysis-effort",
