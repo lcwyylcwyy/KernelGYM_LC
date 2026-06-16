@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -27,11 +27,16 @@ class EvaluationTask:
     use_reference_cache: bool = False
     is_valid: bool = False
     enable_profiling: Optional[bool] = None
+    enable_ncu_profiling: Optional[bool] = None
+    ncu_metrics: Optional[List[str]] = None
+    enable_nsys_profiling: Optional[bool] = None
     enable_triton_detection: Optional[bool] = None
     measure_performance: Optional[bool] = None
     run_correctness: Optional[bool] = None
     run_triton_detection: Optional[bool] = None
     run_performance: Optional[bool] = None
+    return_reference_triton: bool = False
+    reference_triton_max_chars: int = 120000
     resources: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -59,6 +64,8 @@ class ReferenceTimingTask:
     entry_point: str = "Model"
     reference_backend: Optional[str] = None
     device_preference: Optional[str] = None
+    return_reference_triton: bool = False
+    reference_triton_max_chars: int = 120000
     resources: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -88,6 +95,9 @@ class KernelEvaluationTask:
     entry_point: str = "Model"
     device_preference: Optional[str] = None
     enable_profiling: Optional[bool] = None
+    enable_ncu_profiling: Optional[bool] = None
+    ncu_metrics: Optional[List[str]] = None
+    enable_nsys_profiling: Optional[bool] = None
     enable_triton_detection: Optional[bool] = None
     measure_performance: Optional[bool] = None
     run_correctness: Optional[bool] = None

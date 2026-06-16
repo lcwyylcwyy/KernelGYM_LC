@@ -7,6 +7,8 @@ import httpx
 
 DEFAULT_SERVER_URLS = (
     os.getenv("KERNELGYM_SERVER_URL"),
+    "http://172.19.0.1:8002",
+    "http://172.17.2.155:8002",
     "http://192.168.31.68:8001",
     "http://localhost:10907",
 )

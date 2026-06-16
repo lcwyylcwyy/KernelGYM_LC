@@ -64,6 +64,14 @@ class KernelBenchToolkit(Toolkit):
                 KernelEvaluationTask.from_dict(task),
                 verbose_errors=task.get("verbose_errors", True),
                 enable_profiling=task.get("enable_profiling", settings.enable_profiling),
+                enable_ncu_profiling=task.get(
+                    "enable_ncu_profiling",
+                    settings.enable_ncu_profiling,
+                ),
+                enable_nsys_profiling=task.get(
+                    "enable_nsys_profiling",
+                    getattr(settings, "enable_nsys_profiling", False),
+                ),
                 backend_adapter=backend,
             )
         else:
@@ -116,6 +124,14 @@ class KernelBenchToolkit(Toolkit):
             enable_profiling = task.enable_profiling
             if enable_profiling is None:
                 enable_profiling = settings.enable_profiling
+            enable_ncu_profiling = task.enable_ncu_profiling
+            if enable_ncu_profiling is None:
+                enable_ncu_profiling = settings.enable_ncu_profiling
+            enable_nsys_profiling = getattr(task, "enable_nsys_profiling", None)
+            if enable_nsys_profiling is None:
+                enable_nsys_profiling = getattr(
+                    settings, "enable_nsys_profiling", False
+                )
 
             result = kernelbench_pipeline.eval_kernel_against_ref(
                 original_model_src=task.reference_code,
@@ -128,6 +144,9 @@ class KernelBenchToolkit(Toolkit):
                 backend=task.backend,
                 entry_point=task.entry_point,
                 enable_profiling=bool(enable_profiling),
+                enable_ncu_profiling=bool(enable_ncu_profiling),
+                ncu_metrics=task.ncu_metrics or settings.ncu_metrics,
+                enable_nsys_profiling=bool(enable_nsys_profiling),
                 enable_triton_detection=enable_triton_detection,
                 backend_adapter=backend_adapter,
             )
@@ -210,6 +229,8 @@ class KernelBenchToolkit(Toolkit):
                 device=device,
                 entry_point=task.entry_point,
                 reference_backend=task.reference_backend,
+                return_reference_triton=task.return_reference_triton,
+                reference_triton_max_chars=task.reference_triton_max_chars,
                 backend_adapter=backend_adapter,
             )
             reference_runtime = ref_exec_result.runtime
@@ -250,6 +271,8 @@ class KernelBenchToolkit(Toolkit):
         task: KernelEvaluationTask,
         verbose_errors: bool = True,
         enable_profiling: bool = False,
+        enable_ncu_profiling: bool = False,
+        enable_nsys_profiling: bool = False,
         backend_adapter=None,
     ) -> KernelEvaluationResult:
         device = torch.device(task.device)
@@ -302,6 +325,13 @@ class KernelBenchToolkit(Toolkit):
                 backend=task.backend,
                 entry_point=task.entry_point,
                 enable_profiling=enable_profiling,
+                enable_ncu_profiling=bool(enable_ncu_profiling),
+                ncu_metrics=task.ncu_metrics or settings.ncu_metrics,
+                enable_nsys_profiling=bool(
+                    enable_nsys_profiling
+                    if enable_nsys_profiling
+                    else getattr(task, "enable_nsys_profiling", None)
+                ),
                 enable_triton_detection=enable_triton_detection,
                 backend_adapter=backend_adapter,
             )

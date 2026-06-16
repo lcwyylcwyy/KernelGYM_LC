@@ -64,6 +64,175 @@ def _json_default(obj):
         return bool(obj)
     return str(obj)
 
+
+def _normalize_prompt_index(prompt_index):
+    if isinstance(prompt_index, np.generic):
+        return prompt_index.item()
+    return prompt_index
+
+
+def _extract_completed_prompt_indices(dataproto: Optional[DataProto]) -> set:
+    if dataproto is None:
+        return set()
+
+    prompt_indices = dataproto.non_tensor_batch.get("prompt_index")
+    if prompt_indices is None:
+        return set()
+
+    if hasattr(prompt_indices, "tolist"):
+        prompt_indices = prompt_indices.tolist()
+
+    return {
+        _normalize_prompt_index(prompt_index)
+        for prompt_index in prompt_indices
+        if prompt_index is not None
+    }
+
+
+def _save_dataproto_checkpoint(dataproto: DataProto, filepath: str) -> None:
+    tmp_filepath = f"{filepath}.tmp"
+    if os.path.exists(tmp_filepath):
+        os.remove(tmp_filepath)
+    dataproto.save_to_disk(tmp_filepath)
+    os.replace(tmp_filepath, filepath)
+
+
+def _accumulate_reward_extra_metrics(
+    batch: DataProto,
+    reward_extra_info_dict: defaultdict,
+) -> None:
+    reward_tensor = batch.batch.get("token_level_scores")
+    if reward_tensor is None:
+        return
+
+    cur_data_source = batch.non_tensor_batch.get(
+        "data_source", ["unknown"] * reward_tensor.shape[0]
+    )
+    reward_extra_info_raw = batch.non_tensor_batch.get("reward_extra_info")
+    if reward_extra_info_raw is None:
+        reward_extra_info_list = []
+    elif hasattr(reward_extra_info_raw, "tolist"):
+        reward_extra_info_list = reward_extra_info_raw.tolist()
+    else:
+        reward_extra_info_list = list(reward_extra_info_raw)
+
+    valid_indices = []
+    for i, info in enumerate(reward_extra_info_list):
+        if len(info) == 0:
+            continue
+        has_kernel_metrics = any(
+            key in info
+            for key in ["correctness", "performance", "compiled", "success"]
+        )
+        if has_kernel_metrics:
+            valid_indices.append(i)
+
+    if not valid_indices:
+        return
+
+    valid_reward_extra_info_list = [reward_extra_info_list[i] for i in valid_indices]
+    valid_data_sources = [cur_data_source[i] for i in valid_indices]
+
+    reward_extra_keys = sorted(
+        {
+            key
+            for info in valid_reward_extra_info_list
+            if isinstance(info, dict)
+            for key in info.keys()
+            if key not in {"reward_extra_info", "ncu"}
+        }
+    )
+    for key in reward_extra_keys:
+        for info, data_source in zip(valid_reward_extra_info_list, valid_data_sources):
+            if key not in info:
+                continue
+            composed_key = f"{key}_{data_source}"
+            reward_extra_info_dict[composed_key].append(info[key])
+
+
+def _extend_raw_response_logs(
+    batch: DataProto,
+    tokenizer,
+    input_texts: list,
+    output_texts: list,
+) -> None:
+    if "input_ids" not in batch.batch or "responses" not in batch.batch:
+        return
+
+    input_texts.extend(
+        tokenizer.decode(ids, skip_special_tokens=True)
+        for ids in batch.batch["input_ids"]
+    )
+    output_texts.extend(
+        tokenizer.decode(ids, skip_special_tokens=True)
+        for ids in batch.batch["responses"]
+    )
+
+
+def _restore_multiturn_logging_from_dataproto(
+    batch: DataProto,
+    tokenizer,
+    sample_inputs: list,
+    sample_outputs: list,
+    sample_scores: list,
+    uid_to_conversation: dict,
+) -> None:
+    if "turn_indices" not in batch.batch:
+        return
+
+    uids = batch.non_tensor_batch.get("uid")
+    if uids is None:
+        return
+
+    turn_indices = batch.batch["turn_indices"].cpu().numpy()
+    multiturn_messages = batch.non_tensor_batch.get("multiturn_messages", None)
+    token_level_scores = batch.batch.get("token_level_scores")
+    if token_level_scores is None:
+        scores = [0.0] * len(batch.batch)
+    else:
+        scores = token_level_scores.sum(-1).cpu().tolist()
+
+    sample_data = {}
+    for i in range(len(batch.batch)):
+        uid = uids[i]
+        turn_id = int(turn_indices[i])
+        if turn_id == -1:
+            continue
+
+        if uid not in sample_data:
+            sample_data[uid] = {"first_idx": i, "score": 0.0}
+        sample_data[uid]["score"] += scores[i]
+
+    for uid in sorted(sample_data.keys(), key=str):
+        first_idx = sample_data[uid]["first_idx"]
+        messages = None
+        if multiturn_messages is not None:
+            messages = multiturn_messages[first_idx]
+
+        if messages is not None:
+            first_user_msg = ""
+            for msg in messages:
+                if msg.get("role") == "user":
+                    first_user_msg = msg.get("content", "")
+                    break
+            full_output = ""
+            for msg in messages:
+                role = msg.get("role", "unknown")
+                content = msg.get("content", "")
+                full_output += f"[{role}]\n{content}\n\n"
+        else:
+            first_user_msg = tokenizer.decode(
+                batch.batch["prompts"][first_idx], skip_special_tokens=True
+            ) if "prompts" in batch.batch else ""
+            full_output = tokenizer.decode(
+                batch.batch["responses"][first_idx], skip_special_tokens=True
+            ) if "responses" in batch.batch else ""
+
+        sample_inputs.append(first_user_msg)
+        sample_outputs.append(full_output)
+        sample_scores.append(sample_data[uid]["score"])
+        uid_to_conversation[uid] = full_output
+
 def _parse_turn_id_from_filename(filename: str) -> int:
     """Extract numeric turn_id from a filename like turn_12_eval.json."""
     match = re.search(r"turn_(\d+)_eval\.json$", filename)
@@ -905,7 +1074,24 @@ def main(config):
 def run_generation(config):
     if not ray.is_initialized():
         # this is for local ray cluster
-        ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
+        from omegaconf import OmegaConf
+
+        ray_init_kwargs = OmegaConf.to_container(config.get('ray_kwargs', {}).get('ray_init', {}), resolve=True) or {}
+        ray_init_kwargs = {key: value for key, value in ray_init_kwargs.items() if value is not None}
+
+        runtime_env = dict(ray_init_kwargs.pop('runtime_env', {}) or {})
+        env_vars = dict(runtime_env.get('env_vars', {}) or {})
+        env_vars.update({'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'})
+        runtime_env['env_vars'] = env_vars
+        ray_init_kwargs['runtime_env'] = runtime_env
+
+        if 'num_gpus' not in ray_init_kwargs and torch.cuda.is_available():
+            detected_gpus = torch.cuda.device_count()
+            if detected_gpus > 0:
+                ray_init_kwargs['num_gpus'] = detected_gpus
+
+        print(f"Initializing local Ray with kwargs: {ray_init_kwargs}")
+        ray.init(**ray_init_kwargs)
 
     return ray.get(main_task.remote(config))
 
@@ -952,6 +1138,205 @@ def _coerce_extra_metric_value(value: Any) -> Optional[float]:
         return None
 
     return None
+
+
+def _run_deferred_profiling(output_batch, input_batch, config, tokenizer):
+    """
+    same_gpu_mode: after vLLM releases GPU memory (sleep), re-submit compiled kernels
+    to the KernelGYM server with profiling enabled. Updates token_level_scores and
+    reward_extra_info in output_batch in-place.
+
+    Args:
+        output_batch: DataProto from generate_sequences (has kernel codes, per-turn scores)
+        input_batch:  DataProto with ground_truth (reward_model) and entry_point (extra_info)
+        config:       Hydra config (config.reward_model used for reward_config)
+        tokenizer:    tokenizer for decoding response token IDs
+
+    Returns:
+        Updated output_batch with profiling results applied.
+    """
+    from kernel.rewards.kernel_reward import compute_kernel_reward_batch
+
+    reward_extra_info_raw = output_batch.non_tensor_batch.get("reward_extra_info", None)
+    if reward_extra_info_raw is None:
+        print("[SameGPUMode] No reward_extra_info in output_batch, skipping deferred profiling.")
+        return output_batch
+
+    if hasattr(reward_extra_info_raw, "tolist"):
+        reward_extra_info_list = reward_extra_info_raw.tolist()
+    else:
+        reward_extra_info_list = list(reward_extra_info_raw)
+
+    # Build UID → metadata maps from input_batch (one row per sample, before multi-turn repeat)
+    input_uids = input_batch.non_tensor_batch.get("uid", None)
+    if input_uids is None:
+        print("[SameGPUMode] No uid in input_batch, skipping deferred profiling.")
+        return output_batch
+
+    uid_to_reward_model = {}
+    uid_to_entry_point = {}
+    reward_model_arr = input_batch.non_tensor_batch.get("reward_model", None)
+    extra_info_arr = input_batch.non_tensor_batch.get("extra_info", None)
+
+    for i, uid in enumerate(input_uids):
+        uid_str = str(uid)
+        rm = reward_model_arr[i] if reward_model_arr is not None else None
+        if isinstance(rm, str):
+            try:
+                rm = json.loads(rm)
+            except Exception:
+                rm = {}
+        rm = rm if isinstance(rm, dict) else {}
+        uid_to_reward_model[uid_str] = rm
+
+        entry_point = "Model"
+        if extra_info_arr is not None:
+            try:
+                ei = extra_info_arr[i]
+                if isinstance(ei, dict):
+                    entry_point = ei.get("entry_point", "Model")
+            except Exception:
+                pass
+        # Fallback: try entry_point stored in reward_model dict
+        if entry_point == "Model":
+            entry_point = rm.get("entry_point", "Model")
+        uid_to_entry_point[uid_str] = entry_point
+
+    # Determine which rows to profile (last compiled turn per UID)
+    output_uids = output_batch.non_tensor_batch.get("uid", None)
+    if output_uids is None:
+        print("[SameGPUMode] No uid in output_batch, skipping deferred profiling.")
+        return output_batch
+
+    is_multi_turn = "turn_indices" in output_batch.batch
+    candidate_rows = []
+
+    if is_multi_turn:
+        turn_indices = output_batch.batch["turn_indices"].cpu().numpy()
+        uid_best = {}  # uid_str -> (turn_id, row_idx) of last compiled turn
+        for i in range(len(output_batch.batch)):
+            t_idx = int(turn_indices[i])
+            if t_idx == -1:
+                continue  # skip padding turns
+            uid_str = str(output_uids[i])
+            extra = reward_extra_info_list[i] if i < len(reward_extra_info_list) else {}
+            compiled = extra.get("compiled", False) if isinstance(extra, dict) else False
+            if compiled:
+                if uid_str not in uid_best or t_idx > uid_best[uid_str][0]:
+                    uid_best[uid_str] = (t_idx, i)
+        candidate_rows = [row_idx for _, (_, row_idx) in uid_best.items()]
+    else:
+        for i in range(len(output_batch.batch)):
+            extra = reward_extra_info_list[i] if i < len(reward_extra_info_list) else {}
+            compiled = extra.get("compiled", False) if isinstance(extra, dict) else False
+            if compiled:
+                candidate_rows.append(i)
+
+    if not candidate_rows:
+        print("[SameGPUMode] No compiled kernels found for deferred profiling.")
+        return output_batch
+
+    print(f"[SameGPUMode] Running deferred profiling for {len(candidate_rows)} kernels...")
+
+    solution_strs = []
+    ground_truths = []
+    entry_points = []
+    uuids_list = []
+
+    for row_idx in candidate_rows:
+        response_ids = output_batch.batch["responses"][row_idx]
+        response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
+        solution_strs.append(response_text)
+
+        uid_str = str(output_uids[row_idx])
+        rm = uid_to_reward_model.get(uid_str, {})
+        ground_truth = rm.get("ground_truth") or rm.get("reference_code") or ""
+        ground_truths.append(ground_truth)
+        entry_points.append(uid_to_entry_point.get(uid_str, "Model"))
+        uuids_list.append(uid_str)
+
+    # Submit to KernelGYM with profiling enabled.
+    # _deferred_profiling=True bypasses same_gpu_mode suppression in compute_kernel_reward_batch.
+    try:
+        profiling_results = compute_kernel_reward_batch(
+            solution_strs=solution_strs,
+            ground_truths=ground_truths,
+            entry_points=entry_points,
+            uuids=uuids_list,
+            reward_config=config.reward_model,
+            _deferred_profiling=True,
+            is_valid=True,
+        )
+    except Exception as e:
+        print(f"[SameGPUMode] Deferred profiling failed: {e}. Keeping original scores.")
+        return output_batch
+
+    # Update token_level_scores and reward_extra_info
+    token_level_scores = output_batch.batch["token_level_scores"]
+
+    for i, row_idx in enumerate(candidate_rows):
+        if i >= len(profiling_results):
+            break
+        result = profiling_results[i]
+        if not isinstance(result, dict):
+            continue
+
+        new_score = float(result.get("score", result.get("reward", 0.0)))
+
+        # Replace the reward at the last valid response token position
+        row_scores = token_level_scores[row_idx]
+        nonzero_positions = (row_scores != 0.0).nonzero(as_tuple=True)[0]
+        if len(nonzero_positions) > 0:
+            last_pos = int(nonzero_positions[-1].item())
+            token_level_scores[row_idx, last_pos] = new_score
+        else:
+            # No existing non-zero score; find last valid response token
+            response_mask = output_batch.batch.get("response_mask", None)
+            if response_mask is not None:
+                valid_len = int(response_mask[row_idx].sum().item())
+            else:
+                pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+                valid_len = int((output_batch.batch["responses"][row_idx] != pad_id).sum().item())
+            if valid_len > 0:
+                token_level_scores[row_idx, valid_len - 1] = new_score
+            else:
+                token_level_scores[row_idx, -1] = new_score
+
+        # Update reward_extra_info with profiling results
+        if row_idx < len(reward_extra_info_list) and isinstance(reward_extra_info_list[row_idx], dict):
+            update_payload = {
+                "performance": result.get("speedup", 0.0),
+                "is_speedup_positive": (result.get("speedup") or 0.0) >= 1.0 + getattr(
+                    config.reward_model, "speedup_eps", 0.01
+                ),
+                "profiling_deferred": True,
+                "num_custom_kernel": result.get("num_custom_kernel", 0),
+                "num_total_kernels": result.get("num_total_kernels", 0),
+                "custom_kernel_cuda_time_in_profiling_us": result.get(
+                    "custom_kernel_cuda_time_in_profiling_us", 0
+                ),
+                "total_kernel_run_time_in_profiling_us": result.get(
+                    "total_kernel_run_time_in_profiling_us", 0
+                ),
+            }
+            metadata = result.get("metadata") if isinstance(result, dict) else None
+            if isinstance(metadata, dict) and isinstance(metadata.get("ncu"), dict):
+                update_payload["ncu"] = metadata["ncu"]
+            if isinstance(result.get("ncu"), dict):
+                update_payload["ncu"] = result["ncu"]
+            for source in (metadata, result):
+                if not isinstance(source, dict):
+                    continue
+                for key, value in source.items():
+                    if str(key).startswith("ncu_"):
+                        update_payload[key] = value
+            reward_extra_info_list[row_idx].update(update_payload)
+
+    output_batch.batch["token_level_scores"] = token_level_scores
+    output_batch.non_tensor_batch["reward_extra_info"] = np.array(reward_extra_info_list, dtype=object)
+
+    print(f"[SameGPUMode] Deferred profiling complete. Updated {len(candidate_rows)} samples.")
+    return output_batch
 
 
 @ray.remote(num_cpus=1)
@@ -1006,7 +1391,22 @@ def main_task(config):
         assert config.data.n_samples == 1, 'When temperature=0, n_samples must be 1.'
 
     rollout_mode = config.actor_rollout_ref.rollout.get('mode', 'sync')
+    total_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
+    single_gpu_async_vllm = (
+        rollout_mode == "async_vllm"
+        and config.actor_rollout_ref.rollout.get('backend', 'vllm') == 'vllm'
+        and total_gpus == 1
+        and config.actor_rollout_ref.rollout.get('tensor_model_parallel_size', 1) == 1
+    )
+    if single_gpu_async_vllm:
+        print("Using lightweight standalone backend for single-GPU async_vllm to avoid hybrid rollout worker init.")
     async_rollout_mode = rollout_mode in ("async_vllm", "async_agent", "standalone_vllm")
+
+    same_gpu_mode = getattr(config.reward_model, "same_gpu_mode", False)
+    if same_gpu_mode:
+        print("=" * 80)
+        print("SAME GPU MODE ENABLED: Profiling suppressed during generation; deferred until vLLM sleeps.")
+        print("=" * 80)
 
     # Check if multi-turn is enabled
     multi_turn_enabled = (
@@ -1118,21 +1518,30 @@ def main_task(config):
         collate_fn=collate_fn,
     )
 
-    # if dataproto_path exist, directly load it
+    resumed_dataproto = None
+    completed_prompt_indices = set()
+
+    # if dataproto_path exist, load it and continue from the remaining prompts
     if dataproto_path and os.path.exists(dataproto_path):
-        # read out the existing raw responses
-        print(f"Load DataProto from {dataproto_path}...")
-        all_dataproto = DataProto.load_from_disk(dataproto_path)
-        all_input_texts, all_output_texts = [], []  # Will be populated if needed
-    else:  # otherwise, generate responses
+        print(f"Loading DataProto checkpoint from {dataproto_path}...")
+        resumed_dataproto = DataProto.load_from_disk(dataproto_path)
+        completed_prompt_indices = _extract_completed_prompt_indices(resumed_dataproto)
+        print(
+            f"Resume checkpoint contains {len(completed_prompt_indices)} completed prompts."
+        )
+
+    if resumed_dataproto is None:  # otherwise, generate responses from scratch
         actor_rollout_config = config.actor_rollout_ref
         wg = None
         async_rollout_manager = None
 
-        if rollout_mode == "standalone_vllm":
+        if rollout_mode == "standalone_vllm" or single_gpu_async_vllm:
             from kernel.workers.rollout.async_server import StandaloneVLLMEngineManager
 
-            total_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
+            if single_gpu_async_vllm:
+                print("Using async rollout mode: async_vllm")
+                print("Single-GPU async_vllm will skip hybrid rollout workers and use standalone engine actors.")
+
             async_rollout_manager = StandaloneVLLMEngineManager(
                 config=actor_rollout_config,
                 tokenizer=tokenizer,
@@ -1140,7 +1549,10 @@ def main_task(config):
                 val_reward_fn=reward_fn,
                 total_gpus=total_gpus,
             )
-            print("StandaloneVLLMEngineManager initialized")
+            if single_gpu_async_vllm:
+                print("Single-GPU async_vllm initialized with StandaloneVLLMEngineManager")
+            else:
+                print("StandaloneVLLMEngineManager initialized")
         else:
             # Determine worker class based on rollout mode
             from verl_patch.workers.code.fsdp_workers import AsyncActorRolloutRefWorker
@@ -1185,6 +1597,13 @@ def main_task(config):
                     worker_group=wg,
                 )
                 print("AgentLoopManager initialized")
+
+        # In same_gpu_mode, keep vLLM resident across batches: skip its internal
+        # wake_up/sleep so KV cache is not freed/reallocated between batches.
+        # Profiling co-runs with an idle (loaded) vLLM on the same GPU.
+        if same_gpu_mode and async_rollout_manager is not None and hasattr(async_rollout_manager, "set_keep_warm"):
+            async_rollout_manager.set_keep_warm(True)
+            print("[SameGPUMode] vLLM keep_warm enabled — KV cache retained across batches.")
 
         # Setup for detailed output saving
     output_dir = os.path.dirname(config.data.output_path)
@@ -1853,10 +2272,71 @@ def main_task(config):
     # Fix 1: UID-based conversation mapping for multi-turn alignment
     uid_to_conversation = {}  # Maps UID -> full conversation text
 
+    if resumed_dataproto is not None:
+        all_dataproto.append(resumed_dataproto)
+        if "token_level_scores" in resumed_dataproto.batch:
+            reward_tensor_lst.append(resumed_dataproto.batch["token_level_scores"])
+            data_source_lst.append(
+                resumed_dataproto.non_tensor_batch.get(
+                    "data_source",
+                    np.array(["unknown"] * len(resumed_dataproto), dtype=object),
+                )
+            )
+            _accumulate_reward_extra_metrics(resumed_dataproto, reward_extra_info_dict)
+        _extend_raw_response_logs(
+            resumed_dataproto,
+            tokenizer,
+            all_input_texts,
+            all_output_texts,
+        )
+        if multi_turn_enabled:
+            _restore_multiturn_logging_from_dataproto(
+                resumed_dataproto,
+                tokenizer,
+                sample_inputs,
+                sample_outputs,
+                sample_scores,
+                uid_to_conversation,
+            )
+
     for test_data in dataloader:
 
         print(f"Processing batch {progress_counter}...")
         test_batch = DataProto.from_single_dict(test_data)
+
+        batch_prompt_indices = []
+        prompt_indices_array = test_batch.non_tensor_batch.get("prompt_index")
+        if prompt_indices_array is not None:
+            batch_prompt_indices = [
+                _normalize_prompt_index(prompt_index)
+                for prompt_index in prompt_indices_array.tolist()
+            ]
+
+        if completed_prompt_indices and batch_prompt_indices:
+            keep_mask = np.array(
+                [
+                    prompt_index not in completed_prompt_indices
+                    for prompt_index in batch_prompt_indices
+                ],
+                dtype=bool,
+            )
+            skipped_count = int((~keep_mask).sum())
+            if skipped_count == len(keep_mask):
+                print(
+                    f"Skipping batch {progress_counter}: all {skipped_count} prompts already exist in the checkpoint."
+                )
+                progress_counter += 1
+                continue
+            if skipped_count > 0:
+                print(
+                    f"Resuming batch {progress_counter}: skipping {skipped_count} completed prompts and keeping {int(keep_mask.sum())}."
+                )
+                test_batch = test_batch[keep_mask]
+                batch_prompt_indices = [
+                    prompt_index
+                    for prompt_index, keep in zip(batch_prompt_indices, keep_mask, strict=True)
+                    if keep
+                ]
 
         # CRITICAL: Convert uuid field FIRST before anything else
         # The vllm_async_engine reads "uuid" key (line 2169) and validates it as string
@@ -2005,9 +2485,16 @@ def main_task(config):
         if not async_rollout_mode:
             test_output_gen_batch_padded = wg.generate_sequences(test_gen_batch_padded)
         else:
-            async_rollout_manager.wake_up()
+            # In same_gpu_mode we keep vLLM warm across batches: weights stay resident,
+            # KV cache is not freed/reallocated between batches. Profiling runs alongside
+            # an idle (but loaded) vLLM. Saves the wake_up reallocation cost each batch.
+            if same_gpu_mode:
+                async_rollout_manager.wake_up()  # idempotent; no-op if already awake
+            else:
+                async_rollout_manager.wake_up()
             test_output_gen_batch_padded = async_rollout_manager.generate_sequences(test_gen_batch_padded)
-            async_rollout_manager.sleep()
+            if not same_gpu_mode:
+                async_rollout_manager.sleep()
 
         print('Generation complete for batch')
 
@@ -2082,6 +2569,18 @@ def main_task(config):
                 uids = test_output_gen_batch.non_tensor_batch["uid"]
                 print(f"  - UIDs in output: {uids}")
                 print(f"  - Unique UIDs: {np.unique(uids)}")
+
+        # same_gpu_mode: non-multi-turn batches still need a deferred profiling pass
+        # here in main_grading. Multi-turn same-GPU rollouts now do deferred profiling
+        # inside the async rollout engine's per-round barrier, so skip re-profiling them
+        # at this layer.
+        if same_gpu_mode and async_rollout_mode and not multi_turn_enabled:
+            test_output_gen_batch = _run_deferred_profiling(
+                output_batch=test_output_gen_batch,
+                input_batch=test_batch,
+                config=config,
+                tokenizer=tokenizer,
+            )
 
         if multi_turn_enabled:
             # For multi-turn, use multiturn_messages to build complete conversations
@@ -2191,42 +2690,7 @@ def main_task(config):
         else:
             reward_extra_info_list = list(reward_extra_info_raw)
 
-        valid_indices = []
-        for i, d in enumerate(reward_extra_info_list):
-            if len(d) > 0:
-                # Check if dict has kernel-specific metrics (not just error info)
-                has_kernel_metrics = any(
-                    key in d
-                    for key in [
-                        "correctness",
-                        "performance",
-                        "compiled",
-                        "success",
-                    ]
-                )
-                if has_kernel_metrics:
-                    valid_indices.append(i)
-
-        valid_reward_extra_info_list = [
-            reward_extra_info_list[i] for i in valid_indices
-        ]
-        valid_data_sources = [cur_data_source[i] for i in valid_indices]
-
-        # convert list of dict to dict of list (only for valid entries with kernel metrics)
-        if len(valid_reward_extra_info_list) > 0:
-            raw_reward_extra_info_dict = {
-                k: [d[k] for d in valid_reward_extra_info_list]
-                for k in valid_reward_extra_info_list[0].keys()
-            }
-
-            if reward_extra_info_dict is None:
-                reward_extra_info_dict = {}
-            for key, extra_reward in raw_reward_extra_info_dict.items():
-                for i, data_source in enumerate(valid_data_sources):
-                    composed_key = f"{key}_{data_source}"
-                    if composed_key not in reward_extra_info_dict:
-                        reward_extra_info_dict[composed_key] = []
-                    reward_extra_info_dict[composed_key].append(extra_reward[i])
+        _accumulate_reward_extra_metrics(test_batch, reward_extra_info_dict)
 
         scores = reward_tensor.sum(-1).cpu().tolist()
 
@@ -2267,6 +2731,19 @@ def main_task(config):
         # Accumulate batch data for final processing
         all_dataproto.append(test_batch)
 
+        completed_prompt_indices.update(batch_prompt_indices)
+
+        if dataproto_path:
+            checkpoint_dataproto = (
+                all_dataproto[0]
+                if len(all_dataproto) == 1
+                else DataProto.concat(all_dataproto)
+            )
+            print(
+                f"Saving resumable checkpoint to {dataproto_path} ({len(completed_prompt_indices)} prompts complete)..."
+            )
+            _save_dataproto_checkpoint(checkpoint_dataproto, dataproto_path)
+
         # For raw response logging - decode all inputs/outputs
         input_ids_for_logging = test_batch.batch['input_ids']
         input_texts = [tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids_for_logging]
@@ -2278,12 +2755,29 @@ def main_task(config):
 
         progress_counter += 1
 
-    all_dataproto = DataProto.concat(all_dataproto)
+    # same_gpu_mode kept vLLM warm across batches; release GPU memory now that all batches are done.
+    if same_gpu_mode and async_rollout_mode and async_rollout_manager is not None:
+        try:
+            if hasattr(async_rollout_manager, "set_keep_warm"):
+                async_rollout_manager.set_keep_warm(False)
+            async_rollout_manager.sleep()
+            print("[SameGPUMode] All batches complete; vLLM put to sleep.")
+        except Exception as e:
+            print(f"[SameGPUMode] Final vLLM sleep failed (non-fatal): {e}")
+
+    if not all_dataproto:
+        raise RuntimeError("No evaluation data available after applying resume filters.")
+
+    all_dataproto = (
+        all_dataproto[0]
+        if len(all_dataproto) == 1
+        else DataProto.concat(all_dataproto)
+    )
 
     if dataproto_path:
         # write the test batch into dataproto_path if we specified dataproto_path
         print(f"Saving DataProto to {dataproto_path}...")
-        all_dataproto.save_to_disk(dataproto_path)
+        _save_dataproto_checkpoint(all_dataproto, dataproto_path)
 
     if raw_response_path:
         samples = list(zip(all_input_texts, all_output_texts))
@@ -2470,8 +2964,7 @@ def main_task(config):
     # Save/append the final dataset to a JSONL file
     output_path = config.data.output_path
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    mode = 'a' if os.path.exists(output_path) else 'w'
-    with open(output_path, mode) as f:
+    with open(output_path, 'w') as f:
         for record in dataframe.to_dict(orient='records'):
             f.write(json.dumps(record, default=_json_default) + '\n')
 

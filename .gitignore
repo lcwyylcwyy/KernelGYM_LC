@@ -1,3 +1,32 @@
 data/
 .claude/
+__pycache__/
 *.pyc
+
+# secrets / runtime
+.env
+dump.rdb
+*.log
+
+# generated eval results / logs / outputs (do not commit)
+logs/
+outputs/
+kernelgym/logs/
+valid_claude_opus4/run_logs/
+drkernel/kernel/scripts/eval/claude-opus48-*/
+drkernel/kernel/scripts/eval/claude-opus-4-8-matmul-precision*/
+drkernel/kernel/scripts/eval/claude-fable-5-*/
+drkernel/kernel/scripts/eval/gpt-5.5-weelinking_0526/
+drkernel/kernel/scripts/eval/gpt-5.5-weelinking_0525/
+drkernel/kernel/scripts/eval/outputs/
+drkernel/kernel/scripts/eval/valid_claude_opus4/
+
+# local dev scratch
+_p100_dev/
+_p16_dev/
+.agents/
+.codegraph/
+
+# skill manager lock/manifest (machine-specific)
+skills-lock.json
+*.skill

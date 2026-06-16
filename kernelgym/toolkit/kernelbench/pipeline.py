@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import os
+import io
+import re
+import tempfile
+from contextlib import redirect_stderr, redirect_stdout
 from typing import Any, Dict, Optional, Union
 
 import torch
@@ -17,12 +21,168 @@ from kernelgym.toolkit.kernelbench.loading import (
     load_original_model_and_inputs,
 )
 from kernelgym.toolkit.kernelbench.correctness import run_and_check_correctness
-from kernelgym.toolkit.kernelbench.profiling import compute_triton_kernel_coverage
+from kernelgym.toolkit.kernelbench.profiling import (
+    compute_triton_kernel_coverage,
+    run_ncu_profiling,
+    run_nsys_profiling,
+)
 from kernelgym.toolkit.kernelbench.timing import (
     get_timing_stats,
     run_profiling_only,
     time_execution_with_cuda_event,
 )
+
+
+def _extract_triton_sources_from_output(log_text: str) -> list[str]:
+    if not log_text:
+        return []
+
+    matches: list[str] = []
+    pattern = re.compile(r"async_compile\.triton\([\s\S]*?'''([\s\S]*?)'''\s*\)")
+    for m in pattern.finditer(log_text):
+        code = (m.group(1) or "").strip()
+        if code:
+            matches.append(code)
+
+    if matches:
+        unique: list[str] = []
+        seen = set()
+        for item in matches:
+            if item not in seen:
+                seen.add(item)
+                unique.append(item)
+        return unique
+
+    if "@triton.jit" in log_text:
+        start = log_text.find("@triton.jit")
+        return [log_text[start:].strip()]
+
+    return []
+
+
+def _resolve_inductor_cache_dir() -> str:
+    cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+    if cache_dir:
+        return cache_dir
+    user = os.environ.get("USER") or ""
+    return f"/tmp/torchinductor_{user}" if user else "/tmp/torchinductor"
+
+
+def _snapshot_inductor_python_files(cache_dir: str) -> Dict[str, float]:
+    snapshot: Dict[str, float] = {}
+    if not cache_dir or not os.path.isdir(cache_dir):
+        return snapshot
+    for root, _dirs, files in os.walk(cache_dir):
+        for name in files:
+            if not name.endswith(".py"):
+                continue
+            path = os.path.join(root, name)
+            try:
+                snapshot[path] = os.path.getmtime(path)
+            except OSError:
+                continue
+    return snapshot
+
+
+def _extract_triton_sources_from_inductor_cache(
+    cache_dir: str,
+    before_snapshot: Dict[str, float],
+    max_files: int = 40,
+) -> list[str]:
+    after_snapshot = _snapshot_inductor_python_files(cache_dir)
+    if not after_snapshot:
+        return []
+
+    changed = []
+    for path, mtime in after_snapshot.items():
+        prev = before_snapshot.get(path)
+        if prev is None or mtime > prev:
+            changed.append((path, mtime))
+    if changed:
+        candidates = changed
+    else:
+        candidates = list(after_snapshot.items())
+    candidates.sort(key=lambda item: item[1], reverse=True)
+
+    collected: list[str] = []
+    seen = set()
+    for path, _mtime in candidates[:max_files]:
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+                content = handle.read()
+        except OSError:
+            continue
+        for src in _extract_triton_sources_from_output(content):
+            if src not in seen:
+                seen.add(src)
+                collected.append(src)
+
+    return collected
+
+
+def _get_full_triton_files_from_cache(
+    cache_dir: str,
+    before_snapshot: Optional[Dict[str, float]] = None,
+    max_files: int = 20,
+) -> list[str]:
+    """Return the full content of inductor-generated Python files that contain Triton kernels.
+
+    Unlike ``_extract_triton_sources_from_inductor_cache``, this function returns the
+    *entire* file content rather than just the inner kernel source extracted from the
+    ``async_compile.triton(...)`` triple-quoted string.  Each returned string is a
+    complete standalone Python module that can be executed directly – it includes all
+    imports, ``@triton.jit`` kernel definitions, ``triton_heuristics`` wrappers, the
+    ``async_compile`` setup, and the ``call(args)`` invocation function.
+    """
+    after_snapshot = _snapshot_inductor_python_files(cache_dir)
+    if not after_snapshot:
+        return []
+
+    if before_snapshot:
+        changed = [
+            (path, mtime)
+            for path, mtime in after_snapshot.items()
+            if before_snapshot.get(path) is None or mtime > before_snapshot[path]
+        ]
+        candidates = changed if changed else list(after_snapshot.items())
+    else:
+        candidates = list(after_snapshot.items())
+
+    candidates.sort(key=lambda item: item[1], reverse=True)
+
+    collected: list[str] = []
+    seen_hashes: set[int] = set()
+    for path, _mtime in candidates[:max_files]:
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                content = fh.read()
+        except OSError:
+            continue
+        # Only include the AOT wrapper files (which contain the full call() invocation
+        # and are directly runnable).  Skip raw kernel-only cache files that contain
+        # only the @triton.jit definition without a call() entry point – those are the
+        # source of the duplicate content.
+        is_wrapper = "# AOT ID:" in content or (
+            "async_compile.wait(" in content and "def call(" in content
+        )
+        if not is_wrapper:
+            continue
+        h = hash(content)
+        if h not in seen_hashes:
+            seen_hashes.add(h)
+            collected.append(content)
+
+    return collected
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return text
+    if len(text) <= max_chars:
+        return text
+    suffix = f"\n\n# ... truncated, total_chars={len(text)}"
+    keep = max(0, max_chars - len(suffix))
+    return text[:keep] + suffix
 
 
 def _run_correctness_step(
@@ -114,6 +274,9 @@ def _run_triton_detection_step(
 
 def _run_performance_step(
     *,
+    original_model_src: str,
+    custom_model_src: str,
+    entry_point: str,
     kernel_exec_result: KernelExecResult,
     custom_model,
     get_inputs,
@@ -123,6 +286,9 @@ def _run_performance_step(
     seed_num: int,
     device: Union[torch.device, int],
     enable_profiling: bool,
+    enable_ncu_profiling: bool,
+    ncu_metrics: Optional[list[str]],
+    enable_nsys_profiling: bool = False,
 ):
     def _profiling_empty(metrics: Dict[str, Any]) -> bool:
         if not metrics:
@@ -325,6 +491,43 @@ def _run_performance_step(
                 print(f"[Eval] Performance Stats: {runtime_stats}")
             kernel_exec_result.runtime = runtime_stats["mean"]
             kernel_exec_result.runtime_stats = runtime_stats
+
+            if enable_ncu_profiling:
+                print("[NCU] Running Nsight Compute counter profiling...")
+                ncu_result = run_ncu_profiling(
+                    original_model_src=original_model_src,
+                    custom_model_src=custom_model_src,
+                    entry_point=entry_point,
+                    device=device,
+                    metrics=ncu_metrics,
+                    seed_num=seed_num,
+                    num_warmup=1,
+                    num_trials=1,
+                    timeout_sec=max(120, min(600, num_perf_trials * 30)),
+                )
+                metadata["ncu"] = ncu_result
+                for key, value in (ncu_result.get("scalars") or {}).items():
+                    metadata[key] = value
+                if kernel_exec_result and isinstance(kernel_exec_result.metadata, dict):
+                    kernel_exec_result.metadata["ncu"] = ncu_result
+                    for key, value in (ncu_result.get("scalars") or {}).items():
+                        kernel_exec_result.metadata[key] = value
+
+            if enable_nsys_profiling:
+                print("[NSYS] Running Nsight Systems timeline profiling...")
+                nsys_result = run_nsys_profiling(
+                    original_model_src=original_model_src,
+                    custom_model_src=custom_model_src,
+                    entry_point=entry_point,
+                    device=device,
+                    seed_num=seed_num,
+                    num_warmup=3,
+                    num_trials=max(5, min(20, num_perf_trials)),
+                    timeout_sec=max(120, min(600, num_perf_trials * 30)),
+                )
+                metadata["nsys"] = nsys_result
+                if kernel_exec_result and isinstance(kernel_exec_result.metadata, dict):
+                    kernel_exec_result.metadata["nsys"] = nsys_result
     except Exception as e:
         if verbose:
             print(f"[Eval] Error in Measuring Performance: {e}")
@@ -345,6 +548,9 @@ def eval_kernel_against_ref(
     backend: str = "cuda",
     entry_point: str = "Model",
     enable_profiling: bool = True,
+    enable_ncu_profiling: bool = False,
+    ncu_metrics: Optional[list[str]] = None,
+    enable_nsys_profiling: bool = False,
     enable_triton_detection: bool = True,
     backend_adapter: Optional[Any] = None,
 ) -> KernelExecResult:
@@ -541,6 +747,9 @@ def eval_kernel_against_ref(
 
     if measure_performance:
         _run_performance_step(
+            original_model_src=original_model_src,
+            custom_model_src=custom_model_src,
+            entry_point=entry_point,
             kernel_exec_result=kernel_exec_result,
             custom_model=custom_model,
             get_inputs=get_inputs,
@@ -550,6 +759,9 @@ def eval_kernel_against_ref(
             seed_num=seed_num,
             device=device,
             enable_profiling=enable_profiling,
+            enable_ncu_profiling=enable_ncu_profiling,
+            ncu_metrics=ncu_metrics,
+            enable_nsys_profiling=enable_nsys_profiling,
         )
 
     _cleanup()
@@ -568,6 +780,8 @@ def eval_reference_only(
     ),
     entry_point: str = "Model",
     reference_backend: Optional[str] = None,
+    return_reference_triton: bool = False,
+    reference_triton_max_chars: int = 120000,
     backend_adapter: Optional[Any] = None,
 ) -> KernelExecResult:
     assert torch.cuda.is_available(), "CUDA is not available, cannot run Eval"
@@ -616,7 +830,9 @@ def eval_reference_only(
         metadata["model_load_error_name"] = get_error_name(e)
         return KernelExecResult(compiled=False, correctness=False, metadata=metadata)
 
-    kernel_exec_result = KernelExecResult(compiled=True, correctness=True, metadata=metadata)
+    # KernelExecResult (Pydantic model) may copy dict inputs, so keep metadata authoritative
+    # in the local variable and assign it back before returning.
+    kernel_exec_result = KernelExecResult(compiled=True, correctness=True, metadata={})
 
     try:
         if verbose:
@@ -633,12 +849,106 @@ def eval_reference_only(
         if reference_backend:
             backend_name = reference_backend.lower()
             metadata["reference_backend"] = backend_name
+            metadata["reference_triton_capture_requested"] = bool(return_reference_triton)
             print(f"[Eval] reference_backend={backend_name}")
+            print(
+                "[Eval] reference_triton_capture_requested="
+                f"{bool(return_reference_triton)}"
+            )
             if backend_name in ("torch_compile", "torch-compile", "compile"):
                 try:
                     if not hasattr(torch, "compile"):
                         raise RuntimeError("torch.compile is not available")
-                    model = torch.compile(model)
+                    if return_reference_triton:
+                        # Use a fresh temp dir so we can reliably identify the
+                        # files written by *this* compile call and read them
+                        # back as complete standalone modules.
+                        inductor_cache_dir = tempfile.mkdtemp(prefix="kgym_inductor_")
+                        prev_inductor_cache = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+                        os.environ["TORCHINDUCTOR_CACHE_DIR"] = inductor_cache_dir
+
+                        prev_torch_logs = os.environ.get("TORCH_LOGS")
+                        prev_torch_compile_debug = os.environ.get("TORCH_COMPILE_DEBUG")
+                        if prev_torch_logs:
+                            if "output_code" not in prev_torch_logs:
+                                os.environ["TORCH_LOGS"] = f"{prev_torch_logs},+output_code"
+                        else:
+                            os.environ["TORCH_LOGS"] = "+output_code"
+                        os.environ["TORCH_COMPILE_DEBUG"] = "1"
+
+                        # Ensure compile/codegen is re-triggered in long-lived workers.
+                        try:
+                            import torch._dynamo as _dynamo
+
+                            _dynamo.reset()
+                            metadata["reference_triton_dynamo_reset"] = True
+                        except Exception:
+                            metadata["reference_triton_dynamo_reset"] = False
+
+                        capture_buffer = io.StringIO()
+                        try:
+                            with redirect_stdout(capture_buffer), redirect_stderr(capture_buffer):
+                                model = torch.compile(model)
+                                # Trigger graph compile once so codegen files are written.
+                                warmup_inputs = get_inputs()
+                                warmup_inputs = [
+                                    x.cuda(device=device) if isinstance(x, torch.Tensor) else x
+                                    for x in warmup_inputs
+                                ]
+                                _ = model(*warmup_inputs)
+                                torch.cuda.synchronize(device=device)
+                        finally:
+                            if prev_torch_logs is None:
+                                os.environ.pop("TORCH_LOGS", None)
+                            else:
+                                os.environ["TORCH_LOGS"] = prev_torch_logs
+                            if prev_torch_compile_debug is None:
+                                os.environ.pop("TORCH_COMPILE_DEBUG", None)
+                            else:
+                                os.environ["TORCH_COMPILE_DEBUG"] = prev_torch_compile_debug
+                            if prev_inductor_cache is None:
+                                os.environ.pop("TORCHINDUCTOR_CACHE_DIR", None)
+                            else:
+                                os.environ["TORCHINDUCTOR_CACHE_DIR"] = prev_inductor_cache
+
+                        # Primary: collect full inductor-generated .py files.
+                        # Each file is a complete standalone module with imports,
+                        # @triton.jit kernel defs, heuristics wrappers, and call().
+                        triton_files = _get_full_triton_files_from_cache(inductor_cache_dir)
+                        extraction_source = "none"
+                        joined = ""
+                        if triton_files:
+                            extraction_source = "inductor_cache_full"
+                            sep = "\n\n# " + "=" * 60 + "\n# next kernel file\n# " + "=" * 60 + "\n\n"
+                            joined = sep.join(triton_files)
+                        else:
+                            # Fallback: parse captured log for inner kernel sources
+                            # (less complete – missing imports and call() code).
+                            captured_logs = capture_buffer.getvalue()
+                            triton_sources = _extract_triton_sources_from_output(captured_logs)
+                            if triton_sources:
+                                extraction_source = "torch_logs_kernel_source"
+                                joined = "\n\n# ---- triton-kernel ----\n\n".join(triton_sources)
+
+                        metadata["reference_triton_capture_enabled"] = True
+                        metadata["reference_triton_extraction_source"] = extraction_source
+                        metadata["reference_triton_count"] = len(triton_files)
+                        metadata["reference_triton_cache_dir"] = inductor_cache_dir
+                        if joined:
+                            metadata["reference_triton_code"] = _truncate_text(
+                                joined,
+                                reference_triton_max_chars,
+                            )
+                        else:
+                            metadata["reference_triton_code"] = ""
+                            captured_logs = capture_buffer.getvalue()
+                            if captured_logs:
+                                metadata["reference_triton_capture_log_excerpt"] = _truncate_text(
+                                    captured_logs,
+                                    min(reference_triton_max_chars, 12000),
+                                )
+                    else:
+                        model = torch.compile(model)
                     metadata["reference_backend_compiled"] = True
                     print("[Eval] torch.compile succeeded")
                 except Exception as e:
@@ -664,7 +974,8 @@ def eval_reference_only(
     except Exception as e:
         if verbose:
             print(f"[Eval] Error in Measuring Performance: {e}")
-        kernel_exec_result.metadata["error_during_performance"] = e
+        metadata["error_during_performance"] = e
 
+    kernel_exec_result.metadata = metadata
     graceful_eval_cleanup(context, device, None)
     return kernel_exec_result

@@ -40,6 +40,7 @@ OUTPUT_DIR="${HDFS_RUNS_PATH}/${RUN_NAME}/grading_results"
 OUTPUT_PATH="${OUTPUT_DIR}/graded_results.parquet"
 METRICS_OUTPUT_PATH="${OUTPUT_DIR}/metrics.json"
 RAW_RESPONSE_PATH="${OUTPUT_DIR}/raw_responses.jsonl"
+DATAPROTO_PATH="${OUTPUT_DIR}/resume_checkpoint.dp"
 HF_MODEL_PATH="/mnt/hstorage/GKG/pretrained_models/drkernel-14b"
 MODEL_NAME="${HF_MODEL_PATH}"
 MODEL_PATH="${MODEL_NAME}"
@@ -117,7 +118,7 @@ export EVAL_DATASET
 export OUTPUT_PATH
 export METRICS_OUTPUT_PATH
 export RAW_RESPONSE_PATH
-# export DATAPROTO_PATH  # Uncomment if using cache
+export DATAPROTO_PATH
 
 export MODEL_NAME
 export MODEL_PATH

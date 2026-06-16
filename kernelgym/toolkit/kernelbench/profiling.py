@@ -4,14 +4,787 @@ from __future__ import annotations
 
 import logging
 import os
+import csv
+import io
+import json
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
 from kernelgym.config import settings
+from kernelgym.config.ncu_metrics import DEFAULT_NCU_METRICS
 
 logger = logging.getLogger("kernelgym.toolkit.kernelbench.profiling")
+
+NCU_SCALAR_ALIASES = {
+    "sm__inst_executed_pipe_fma.sum": ("ncu_sm_inst_executed_pipe_fma_sum", "sum"),
+    "sm__inst_executed.sum": ("ncu_sm_inst_executed_sum", "sum"),
+    "sm__cycles_active.avg": ("ncu_sm_cycles_active_avg", "avg"),
+    "sm__cycles_elapsed.avg": ("ncu_sm_cycles_elapsed_avg", "avg"),
+    "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum": (
+        "ncu_l1tex_data_bank_conflicts_shared_ld_sum",
+        "sum",
+    ),
+    "l1tex__t_sector_hit_rate.pct": ("ncu_l1tex_t_sector_hit_rate_pct", "avg"),
+    "smsp__warp_issue_stalled_barrier_per_warp_active.pct": (
+        "ncu_warp_stall_barrier_pct",
+        "avg",
+    ),
+    "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct": (
+        "ncu_warp_stall_short_scoreboard_pct",
+        "avg",
+    ),
+}
+
+
+def normalize_ncu_metrics(metrics: Optional[Union[str, Sequence[str]]]) -> List[str]:
+    """Return a clean metric list from config/request values."""
+    if metrics is None or metrics == "":
+        return list(DEFAULT_NCU_METRICS)
+    if isinstance(metrics, str):
+        try:
+            parsed = json.loads(metrics)
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        except Exception:
+            pass
+        return [item.strip() for item in metrics.split(",") if item.strip()]
+    return [str(item).strip() for item in metrics if str(item).strip()]
+
+
+def _parse_ncu_number(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    text = str(value).strip().replace(",", "")
+    if not text or text.lower() in {"n/a", "na", "nan", "--"}:
+        return None
+    if text.endswith("%"):
+        text = text[:-1].strip()
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _row_value(row: Dict[str, Any], *names: str) -> Any:
+    lowered = {str(key).strip().lower(): value for key, value in row.items()}
+    for name in names:
+        value = lowered.get(name.lower())
+        if value is not None:
+            return value
+    return None
+
+
+def _aggregate_ncu_value(metric_name: str, metric_payload: Dict[str, Any]) -> Optional[float]:
+    if not metric_payload.get("count"):
+        return None
+    if metric_name.endswith(".sum"):
+        return metric_payload.get("sum")
+    if metric_name.endswith(".avg") or metric_name.endswith(".pct"):
+        return metric_payload.get("avg")
+    return metric_payload.get("avg")
+
+
+def _append_ncu_metric(
+    grouped: Dict[str, Dict[str, Any]],
+    metric_name: str,
+    value: float,
+    unit: Any = "",
+    kernel_name: Any = "",
+) -> None:
+    payload = grouped.setdefault(
+        metric_name,
+        {
+            "unit": str(unit or ""),
+            "count": 0,
+            "sum": 0.0,
+            "avg": 0.0,
+            "min": value,
+            "max": value,
+            "values": [],
+            "per_kernel": [],
+        },
+    )
+    payload["count"] += 1
+    payload["sum"] += value
+    payload["min"] = min(payload["min"], value)
+    payload["max"] = max(payload["max"], value)
+    payload["values"].append(value)
+    payload["per_kernel"].append(
+        {
+            "kernel_name": str(kernel_name or ""),
+            "value": value,
+            "unit": payload["unit"],
+        }
+    )
+
+
+def _finalize_ncu_metrics(grouped: Dict[str, Dict[str, Any]]) -> None:
+    for metric_name, payload in grouped.items():
+        count = int(payload.get("count") or 0)
+        payload["avg"] = payload["sum"] / count if count else 0.0
+        payload["value"] = _aggregate_ncu_value(metric_name, payload)
+
+
+def build_ncu_scalar_aliases(metrics: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
+    scalars: Dict[str, float] = {}
+    for metric_name, (alias, reducer) in NCU_SCALAR_ALIASES.items():
+        metric_payload = metrics.get(metric_name)
+        if not metric_payload:
+            continue
+        value = metric_payload.get(reducer)
+        if value is not None:
+            scalars[alias] = float(value)
+
+    fma = scalars.get("ncu_sm_inst_executed_pipe_fma_sum")
+    inst = scalars.get("ncu_sm_inst_executed_sum")
+    if fma is not None and inst and inst > 0:
+        scalars["ncu_fma_instruction_ratio"] = float(fma / inst)
+
+    active = scalars.get("ncu_sm_cycles_active_avg")
+    elapsed = scalars.get("ncu_sm_cycles_elapsed_avg")
+    if active is not None and elapsed and elapsed > 0:
+        scalars["ncu_active_elapsed_cycle_ratio"] = float(active / elapsed)
+
+    return scalars
+
+
+def _parse_ncu_wide_csv(
+    lines: List[str],
+    header_index: int,
+    metrics_filter: set[str],
+) -> Dict[str, Dict[str, Any]]:
+    reader = csv.reader(io.StringIO("\n".join(lines[header_index:])))
+    try:
+        header = next(reader)
+    except StopIteration:
+        return {}
+
+    metric_indices = {
+        metric_name: idx
+        for idx, metric_name in enumerate(header)
+        if metric_name in metrics_filter
+    }
+    if not metric_indices:
+        return {}
+
+    try:
+        unit_row = next(reader)
+    except StopIteration:
+        unit_row = []
+
+    id_index = header.index("ID") if "ID" in header else None
+    kernel_index = header.index("Kernel Name") if "Kernel Name" in header else None
+    grouped: Dict[str, Dict[str, Any]] = {}
+
+    for row in reader:
+        if id_index is not None:
+            row_id = row[id_index].strip() if id_index < len(row) else ""
+            if not row_id:
+                continue
+        kernel_name = row[kernel_index] if kernel_index is not None and kernel_index < len(row) else ""
+        for metric_name, metric_index in metric_indices.items():
+            raw_value = row[metric_index] if metric_index < len(row) else None
+            value = _parse_ncu_number(raw_value)
+            if value is None:
+                continue
+            unit = unit_row[metric_index] if metric_index < len(unit_row) else ""
+            _append_ncu_metric(grouped, metric_name, value, unit, kernel_name)
+
+    return grouped
+
+
+def _parse_ncu_long_csv(
+    lines: List[str],
+    header_index: int,
+    metrics_filter: set[str],
+) -> Dict[str, Dict[str, Any]]:
+    reader = csv.DictReader(io.StringIO("\n".join(lines[header_index:])))
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for row in reader:
+        metric_name = _row_value(row, "Metric Name", "Metric")
+        if not metric_name:
+            continue
+        metric_name = str(metric_name).strip()
+        if metrics_filter and metric_name not in metrics_filter:
+            continue
+
+        value = _parse_ncu_number(_row_value(row, "Metric Value", "Value"))
+        if value is None:
+            continue
+
+        unit = _row_value(row, "Metric Unit", "Unit")
+        kernel_name = _row_value(row, "Kernel Name", "Kernel")
+        _append_ncu_metric(grouped, metric_name, value, unit, kernel_name)
+
+    return grouped
+
+
+def parse_ncu_csv(
+    csv_text: str,
+    requested_metrics: Optional[Union[str, Sequence[str]]] = None,
+) -> Dict[str, Any]:
+    """Parse Nsight Compute raw CSV into aggregate per-metric payloads."""
+    metrics_filter = set(normalize_ncu_metrics(requested_metrics))
+    lines = [line for line in (csv_text or "").splitlines() if line.strip()]
+    header_index = None
+    wide_header_index = None
+    for idx, line in enumerate(lines):
+        if "Metric Name" in line and "Metric Value" in line:
+            header_index = idx
+            break
+        try:
+            fields = next(csv.reader([line]))
+        except Exception:
+            continue
+        if "Kernel Name" in fields and metrics_filter.intersection(fields):
+            wide_header_index = idx
+            break
+
+    if header_index is None and wide_header_index is None:
+        return {
+            "status": "failed",
+            "metrics": {},
+            "scalars": {},
+            "error": "NCU CSV header not found",
+            "requested_metrics": sorted(metrics_filter),
+        }
+
+    if wide_header_index is not None:
+        grouped = _parse_ncu_wide_csv(lines, wide_header_index, metrics_filter)
+    else:
+        grouped = _parse_ncu_long_csv(lines, header_index or 0, metrics_filter)
+
+    _finalize_ncu_metrics(grouped)
+
+    scalars = build_ncu_scalar_aliases(grouped)
+    missing_metrics = sorted(metrics_filter - set(grouped.keys())) if metrics_filter else []
+    return {
+        "status": "ok" if grouped else "failed",
+        "metrics": grouped,
+        "scalars": scalars,
+        "requested_metrics": sorted(metrics_filter),
+        "missing_metrics": missing_metrics,
+    }
+
+
+def _device_arg(device: Union[torch.device, int, str, None]) -> str:
+    if device is None:
+        return "cuda:0"
+    if isinstance(device, torch.device):
+        if device.type == "cuda":
+            return f"cuda:{device.index if device.index is not None else 0}"
+        return str(device)
+    if isinstance(device, int):
+        return f"cuda:{device}"
+    return str(device)
+
+
+def _write_ncu_driver_script(script_path: Path) -> None:
+    script_path.write_text(
+        r'''
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import torch
+
+from kernelgym.toolkit.kernelbench.exec_types import set_seed
+from kernelgym.toolkit.kernelbench.loading import (
+    graceful_eval_cleanup,
+    load_custom_model_with_tempfile,
+    load_original_model_and_inputs,
+)
+
+
+def _to_cuda(values, device):
+    return [
+        value.cuda(device=device) if isinstance(value, torch.Tensor) else value
+        for value in values
+    ]
+
+
+def main():
+    reference_path = Path(sys.argv[1])
+    kernel_path = Path(sys.argv[2])
+    entry_point = sys.argv[3]
+    device = torch.device(sys.argv[4])
+    seed_num = int(sys.argv[5])
+    num_warmup = int(sys.argv[6])
+    num_trials = int(sys.argv[7])
+
+    torch.cuda.set_device(device)
+    context = {}
+    tempfile_handle = None
+    try:
+        reference_src = reference_path.read_text(encoding="utf-8")
+        kernel_src = kernel_path.read_text(encoding="utf-8")
+        Model, get_init_inputs, get_inputs = load_original_model_and_inputs(
+            reference_src,
+            context,
+            entry_point,
+        )
+
+        set_seed(seed_num)
+        init_inputs = _to_cuda(get_init_inputs(), device)
+        if (
+            len(init_inputs) > 1
+            and hasattr(init_inputs[0], "__len__")
+            and not isinstance(init_inputs[0], (str, torch.Tensor))
+            and len(init_inputs[0]) == 0
+        ):
+            init_inputs = init_inputs[1]
+
+        ModelNew, tempfile_handle = load_custom_model_with_tempfile(
+            kernel_src,
+            entry_point=f"{entry_point}New",
+        )
+        with torch.no_grad():
+            set_seed(seed_num)
+            model_new = ModelNew(*init_inputs) if isinstance(init_inputs, list) else ModelNew(**init_inputs)
+            model_new = model_new.cuda(device=device)
+            inputs = _to_cuda(get_inputs(), device)
+            torch.cuda.synchronize(device=device)
+            for _ in range(num_warmup):
+                model_new(*inputs)
+                torch.cuda.synchronize(device=device)
+            for _ in range(num_trials):
+                model_new(*inputs)
+            torch.cuda.synchronize(device=device)
+    finally:
+        graceful_eval_cleanup(context, device, tempfile_handle)
+
+
+if __name__ == "__main__":
+    main()
+'''.lstrip(),
+        encoding="utf-8",
+    )
+
+
+def _excerpt(text: str, max_chars: int = 4000) -> str:
+    text = text or ""
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars // 2] + "\n... [truncated] ...\n" + text[-max_chars // 2 :]
+
+
+def _kill_process_group(proc: "subprocess.Popen") -> None:
+    """SIGKILL the entire process group of proc. ncu/nsys spawn their own GPU
+    worker grandchildren (run_ncu_target.py); a plain proc.kill() leaves those
+    alive as orphans that keep holding the GPU and CONTAMINATE concurrent timing.
+    proc was started with start_new_session=True, so it is a group leader and its
+    pgid == its pid — kill that group DIRECTLY (do NOT call os.getpgid first: if
+    the leader was already reaped, getpgid raises and a backgrounded grandchild
+    would survive). killpg(pid) still reaches surviving group members even after
+    the leader exits."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    if proc.poll() is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+
+
+_ORPHAN_PROFILER_NEEDLES = (
+    "run_ncu_target",
+    "kgym_ncu_",
+    "kgym_nsys_",
+    "nsight-compute",
+    "nsight-systems",
+)
+
+
+def _reap_orphan_profilers() -> int:
+    """Kill ORPHANED (reparented to init, PPid==1) ncu/nsys profiler processes
+    left behind by a worker that was SIGKILLed mid-profiling (so its in-process
+    cleanup never ran). Called at the start of every profiling run as a safety
+    net. SAFE for multi-GPU/multi-worker: a legitimate concurrent profiler owned
+    by a live worker has PPid != 1 and is never touched."""
+    killed = 0
+    try:
+        pids = os.listdir("/proc")
+    except OSError:
+        return 0
+    for pid_dir in pids:
+        if not pid_dir.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid_dir}/cmdline", "rb") as fh:
+                cmdline = fh.read().replace(b"\x00", b" ").decode("utf-8", "ignore")
+            if not any(n in cmdline for n in _ORPHAN_PROFILER_NEEDLES):
+                continue
+            ppid = 0
+            with open(f"/proc/{pid_dir}/status") as fh:
+                for line in fh:
+                    if line.startswith("PPid:"):
+                        ppid = int(line.split()[1])
+                        break
+            if ppid == 1:
+                os.kill(int(pid_dir), signal.SIGKILL)
+                killed += 1
+        except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError):
+            continue
+    if killed:
+        logger.warning("reaped %d orphaned profiler process(es) before profiling", killed)
+    return killed
+
+
+def _run_capture_killgroup(
+    cmd: Sequence[str],
+    *,
+    env: Dict[str, str],
+    timeout_sec: float,
+    cwd: Optional[str] = None,
+) -> subprocess.CompletedProcess:
+    """Run cmd capturing stdout/stderr in its OWN process group, GUARANTEEING the
+    whole group (incl. ncu/nsys GPU worker grandchildren) is killed on timeout or
+    exit — so a profiler can never leave an orphan hogging the GPU. Raises
+    subprocess.TimeoutExpired (after the group is reaped) on timeout."""
+    proc = subprocess.Popen(
+        list(cmd),
+        cwd=cwd or os.getcwd(),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,  # own session/pgid => killpg reaps all descendants
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout_sec)
+        return subprocess.CompletedProcess(list(cmd), proc.returncode, out, err)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc)
+        try:
+            proc.communicate(timeout=10)
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+    finally:
+        # belt-and-suspenders: reap any descendant that outlived the main process
+        _kill_process_group(proc)
+
+
+def run_ncu_profiling(
+    *,
+    original_model_src: str,
+    custom_model_src: str,
+    entry_point: str,
+    device: Union[torch.device, int, str, None],
+    metrics: Optional[Union[str, Sequence[str]]] = None,
+    seed_num: int = 42,
+    num_warmup: int = 1,
+    num_trials: int = 1,
+    timeout_sec: int = 300,
+) -> Dict[str, Any]:
+    """Run Nsight Compute in a child Python process and parse raw CSV output."""
+    _reap_orphan_profilers()
+    metric_list = normalize_ncu_metrics(metrics)
+    ncu_path = shutil.which("ncu")
+    if not ncu_path:
+        return {
+            "status": "failed",
+            "metrics": {},
+            "scalars": {},
+            "requested_metrics": metric_list,
+            "error": "ncu executable not found on PATH",
+        }
+
+    with tempfile.TemporaryDirectory(prefix="kgym_ncu_") as temp_dir:
+        temp_path = Path(temp_dir)
+        reference_path = temp_path / "reference.py"
+        kernel_path = temp_path / "kernel.py"
+        script_path = temp_path / "run_ncu_target.py"
+        reference_path.write_text(original_model_src, encoding="utf-8")
+        kernel_path.write_text(custom_model_src, encoding="utf-8")
+        _write_ncu_driver_script(script_path)
+
+        cmd = [
+            ncu_path,
+            "--csv",
+            "--page",
+            "raw",
+            "--metrics",
+            ",".join(metric_list),
+            sys.executable,
+            str(script_path),
+            str(reference_path),
+            str(kernel_path),
+            entry_point,
+            _device_arg(device),
+            str(seed_num),
+            str(num_warmup),
+            str(num_trials),
+        ]
+        env = os.environ.copy()
+        repo_root = str(Path(__file__).resolve().parents[3])
+        if env.get("PYTHONPATH"):
+            env["PYTHONPATH"] = os.pathsep.join([repo_root, env["PYTHONPATH"]])
+        else:
+            env["PYTHONPATH"] = repo_root
+        try:
+            completed = _run_capture_killgroup(
+                cmd, env=env, timeout_sec=timeout_sec
+            )
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "metrics": {},
+                "scalars": {},
+                "requested_metrics": metric_list,
+                "error": str(exc),
+            }
+
+    parsed = parse_ncu_csv(completed.stdout, requested_metrics=metric_list)
+    parsed["returncode"] = completed.returncode
+    parsed["stderr"] = _excerpt(completed.stderr)
+    if completed.returncode != 0:
+        parsed["status"] = "failed"
+        parsed["error"] = parsed.get("error") or _excerpt(completed.stderr or completed.stdout)
+    return parsed
+
+
+# Nsight Systems reports relevant to KernelBench Level-2 (system / inter-kernel
+# / timeline dimension): kernel summary (count + hotspots), launch+exec time
+# (launch overhead / queue), and GPU memory ops (layout copies / H2D-D2H).
+NSYS_REPORTS = (
+    "cuda_gpu_kern_sum",
+    "cuda_kern_exec_sum",
+    "cuda_gpu_mem_time_sum",
+    "cuda_api_sum",
+)
+
+
+def _nsys_float(text: str) -> Optional[float]:
+    text = (text or "").strip().replace(",", "")
+    if not text or text in {"-", "N/A"}:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _parse_nsys_csv_report(text: str) -> List[Dict[str, Any]]:
+    """Parse one `nsys stats --format csv` report block into a list of row dicts
+    (numeric cells coerced to float). nsys emits a comment header line starting
+    with '** <report name>' before the CSV header — skip non-CSV preamble."""
+    lines = [ln for ln in (text or "").splitlines() if ln.strip()]
+    start = None
+    for i, ln in enumerate(lines):
+        # the CSV header row contains commas and no leading '**'
+        if not ln.lstrip().startswith("**") and "," in ln:
+            start = i
+            break
+    if start is None:
+        return []
+    rows: List[Dict[str, Any]] = []
+    reader = csv.reader(lines[start:])
+    header = next(reader, None)
+    if not header:
+        return []
+    for cells in reader:
+        if len(cells) < len(header):
+            continue
+        row: Dict[str, Any] = {}
+        for key, val in zip(header, cells):
+            num = _nsys_float(val)
+            row[key.strip()] = num if num is not None else val.strip()
+        rows.append(row)
+    return rows
+
+
+def _summarize_nsys(stats_by_report: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+    """Condense raw nsys report rows into the timeline-level signals the
+    diagnosis skill cares about: kernel count, hotspot table, launch overhead,
+    memcpy traffic."""
+    summary: Dict[str, Any] = {}
+    kern = stats_by_report.get("cuda_gpu_kern_sum") or []
+
+    def _pick(row: Dict[str, Any], *names: str) -> Any:
+        for n in names:
+            for key in row:
+                if key.lower().startswith(n.lower()):
+                    return row[key]
+        return None
+
+    hot = []
+    total_kernel_ns = 0.0
+    for r in kern:
+        t = _pick(r, "Total Time", "Total")
+        inst = _pick(r, "Instances", "Count")
+        name = _pick(r, "Name")
+        if isinstance(t, (int, float)):
+            total_kernel_ns += t
+        hot.append(
+            {
+                "name": str(name)[:100] if name else "?",
+                "total_ns": t,
+                "instances": inst,
+                "avg_ns": _pick(r, "Avg"),
+                "pct": _pick(r, "Time (%)", "Time%", "%"),
+            }
+        )
+    summary["num_distinct_kernels"] = len(kern)
+    summary["total_kernel_time_ns"] = round(total_kernel_ns, 1) if total_kernel_ns else None
+    summary["top_kernels"] = hot[:12]
+
+    mem = stats_by_report.get("cuda_gpu_mem_time_sum") or []
+    mem_rows = []
+    total_mem_ns = 0.0
+    for r in mem:
+        t = _pick(r, "Total Time", "Total")
+        if isinstance(t, (int, float)):
+            total_mem_ns += t
+        mem_rows.append(
+            {
+                "op": str(_pick(r, "Operation", "Name"))[:60],
+                "total_ns": t,
+                "count": _pick(r, "Count", "Instances"),
+            }
+        )
+    summary["mem_ops"] = mem_rows[:8]
+    summary["total_memops_time_ns"] = round(total_mem_ns, 1) if total_mem_ns else None
+
+    api = stats_by_report.get("cuda_api_sum") or []
+    launch_ns = 0.0
+    sync_ns = 0.0
+    for r in api:
+        name = str(_pick(r, "Name") or "")
+        t = _pick(r, "Total Time", "Total")
+        if not isinstance(t, (int, float)):
+            continue
+        if "LaunchKernel" in name:
+            launch_ns += t
+        if "Synchronize" in name:
+            sync_ns += t
+    summary["cuda_launch_api_ns"] = round(launch_ns, 1) if launch_ns else None
+    summary["cuda_sync_api_ns"] = round(sync_ns, 1) if sync_ns else None
+    return summary
+
+
+def run_nsys_profiling(
+    *,
+    original_model_src: str,
+    custom_model_src: str,
+    entry_point: str,
+    device: Union[torch.device, int, str, None],
+    seed_num: int = 42,
+    num_warmup: int = 3,
+    num_trials: int = 10,
+    timeout_sec: int = 300,
+) -> Dict[str, Any]:
+    """Run Nsight Systems on a child Python process and parse the timeline
+    summary (kernel count, hotspots, launch overhead, memcpy traffic).
+
+    This is the system / inter-kernel dimension — orthogonal to NCU's single
+    kernel internals. Cheap (one near-native pass, no replay), so it can run
+    every turn. Returns a compact summary plus the raw per-report rows.
+    """
+    _reap_orphan_profilers()
+    nsys_path = shutil.which("nsys")
+    if not nsys_path:
+        return {"status": "failed", "summary": {}, "error": "nsys not found on PATH"}
+
+    with tempfile.TemporaryDirectory(prefix="kgym_nsys_") as temp_dir:
+        temp_path = Path(temp_dir)
+        reference_path = temp_path / "reference.py"
+        kernel_path = temp_path / "kernel.py"
+        script_path = temp_path / "run_ncu_target.py"
+        rep_path = temp_path / "report"
+        reference_path.write_text(original_model_src, encoding="utf-8")
+        kernel_path.write_text(custom_model_src, encoding="utf-8")
+        _write_ncu_driver_script(script_path)
+
+        env = os.environ.copy()
+        repo_root = str(Path(__file__).resolve().parents[3])
+        env["PYTHONPATH"] = (
+            os.pathsep.join([repo_root, env["PYTHONPATH"]])
+            if env.get("PYTHONPATH")
+            else repo_root
+        )
+
+        profile_cmd = [
+            nsys_path,
+            "profile",
+            "--force-overwrite",
+            "true",
+            "-o",
+            str(rep_path),
+            "--trace",
+            "cuda",
+            "--sample",
+            "none",
+            "--cpuctxsw",
+            "none",
+            sys.executable,
+            str(script_path),
+            str(reference_path),
+            str(kernel_path),
+            entry_point,
+            _device_arg(device),
+            str(seed_num),
+            str(num_warmup),
+            str(num_trials),
+        ]
+        try:
+            prof = _run_capture_killgroup(
+                profile_cmd, env=env, timeout_sec=timeout_sec
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"status": "failed", "summary": {}, "error": str(exc)}
+
+        rep_file = rep_path.with_suffix(".nsys-rep")
+        if not rep_file.exists():
+            alt = list(temp_path.glob("report*.nsys-rep"))
+            rep_file = alt[0] if alt else rep_file
+        if not rep_file.exists():
+            return {
+                "status": "failed",
+                "summary": {},
+                "error": "nsys produced no report",
+                "stderr": _excerpt(prof.stderr or prof.stdout),
+            }
+
+        stats_by_report: Dict[str, List[Dict[str, Any]]] = {}
+        for report in NSYS_REPORTS:
+            try:
+                stats = _run_capture_killgroup(
+                    [
+                        nsys_path,
+                        "stats",
+                        "--report",
+                        report,
+                        "--format",
+                        "csv",
+                        "--force-export",
+                        "true",
+                        str(rep_file),
+                    ],
+                    env=env,
+                    timeout_sec=timeout_sec,
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            stats_by_report[report] = _parse_nsys_csv_report(stats.stdout)
+
+    summary = _summarize_nsys(stats_by_report)
+    return {
+        "status": "ok" if summary.get("num_distinct_kernels") else "empty",
+        "summary": summary,
+        "reports": {k: v[:20] for k, v in stats_by_report.items()},
+    }
 
 
 def compute_triton_kernel_coverage(matched_triton_kernels: List[str], profilling_result: Dict[str, Any]):

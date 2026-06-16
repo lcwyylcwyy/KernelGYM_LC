@@ -49,7 +49,7 @@ def get_cases():
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(
-            "http://192.168.31.68:8001/workflow/submit",
+            "http://192.168.31.68:8003/workflow/submit",
             json={
                 "workflow": "kernel_simple",
                 "task_id": task_id,

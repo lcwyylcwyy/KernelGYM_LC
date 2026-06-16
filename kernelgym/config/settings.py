@@ -7,6 +7,8 @@ from typing import List, Dict, Any
 from pydantic import Field, validator
 from pydantic_settings import BaseSettings
 
+from .ncu_metrics import DEFAULT_NCU_METRICS
+
 PROJECT_ROOT = Path(__file__).parent.parent
 KERNELBENCH_ROOT = PROJECT_ROOT.parent
 
@@ -82,6 +84,21 @@ class Settings(BaseSettings):
         default=1,
         env="PROFILING_RETRY_COUNT",
         description="Retry count when profiler returns empty results (0 to disable).",
+    )
+    enable_ncu_profiling: bool = Field(
+        default=False,
+        env="ENABLE_NCU_PROFILING",
+        description="Enable opt-in Nsight Compute counter profiling after normal timing.",
+    )
+    enable_nsys_profiling: bool = Field(
+        default=False,
+        env="ENABLE_NSYS_PROFILING",
+        description="Enable opt-in Nsight Systems timeline profiling (kernel count / launch overhead / memcpy) after normal timing.",
+    )
+    ncu_metrics: List[str] = Field(
+        default_factory=lambda: list(DEFAULT_NCU_METRICS),
+        env="NCU_METRICS",
+        description="Comma-separated or JSON list of Nsight Compute metrics to collect.",
     )
 
     reference_cache_dataset_path: str = Field(default="", env="REFERENCE_CACHE_DATASET_PATH")
@@ -176,6 +193,24 @@ class Settings(BaseSettings):
             return v
         return ["Hopper"]
 
+    @validator("ncu_metrics", pre=True)
+    def validate_ncu_metrics(cls, v):
+        if v is None or v == "":
+            return list(DEFAULT_NCU_METRICS)
+        if isinstance(v, str):
+            try:
+                import json
+
+                parsed = json.loads(v)
+                if isinstance(parsed, list):
+                    return [str(x).strip() for x in parsed if str(x).strip()]
+            except Exception:
+                pass
+            return [x.strip() for x in v.split(",") if x.strip()]
+        if isinstance(v, list):
+            return [str(x).strip() for x in v if str(x).strip()]
+        return list(DEFAULT_NCU_METRICS)
+
     def setup_log_directory(self) -> None:
         log_path = Path(self.log_dir)
         if not log_path.is_absolute():
@@ -234,6 +269,16 @@ class Settings(BaseSettings):
                     return json.loads(field_value)
                 except Exception:
                     return [field_value]
+            if field_name == "ncu_metrics" and isinstance(field_value, str):
+                try:
+                    import json
+
+                    parsed = json.loads(field_value)
+                    if isinstance(parsed, list):
+                        return [str(x).strip() for x in parsed if str(x).strip()]
+                except Exception:
+                    pass
+                return [x.strip() for x in field_value.split(",") if x.strip()]
             return field_value
 
 

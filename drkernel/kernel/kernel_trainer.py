@@ -1662,7 +1662,8 @@ class RayKernelTrainer(RayPPOTrainer):
             sample_size=self.config.data.val_sample_size,
             apply_chat_template=self.config.data.apply_chat_template,
             return_raw_chat=self.config.data.get("return_raw_chat", False),
-            truncation="error",
+            truncation=self.config.data.get("truncation", "error"),
+            filter_overlong_prompts=self.config.data.filter_overlong_prompts,
             system_prompt_config=self.config.data.get("system_prompt_config", None),
         )
         self.val_dataloader = StatefulDataLoader(
@@ -3302,25 +3303,33 @@ class RayKernelTrainer(RayPPOTrainer):
 
                         actual_input_ids_size = batch.batch["input_ids"].shape[0]
 
-                        if actual_input_ids_size == 0:
-                            raise RuntimeError(
-                                "No valid samples were selected after filtering. "
-                                "Increase rollout number to ensure that there are valid examples for training."
-                            )
-                        elif actual_input_ids_size < expected_input_ids_size:
+                        if actual_input_ids_size < expected_input_ids_size:
                             current_sample_factor = float(
                                 self.config.data.get("prompt_oversampling_factor", 1.0)
                             )
-                            suggested_factor = (
-                                self._compute_suggested_sample_factor(
-                                    expected_input_ids_size, actual_input_ids_size
-                                )
-                                or current_sample_factor
+                            suggested_factor = self._compute_suggested_sample_factor(
+                                expected_input_ids_size, actual_input_ids_size
                             )
                             skip_metrics = {
-                                "over_sampling/suggested_min_oversample_factor": suggested_factor,
                                 "over_sampling/current_sample_oversample_factor": current_sample_factor,
                             }
+                            if suggested_factor is not None:
+                                skip_metrics[
+                                    "over_sampling/suggested_min_oversample_factor"
+                                ] = suggested_factor
+
+                            if actual_input_ids_size == 0:
+                                skip_metrics["train/empty_batch_after_filter"] = 1.0
+                                skip_metrics[
+                                    "train/no_valid_samples_after_filter"
+                                ] = 1.0
+                                logger.log(data=skip_metrics, step=self.global_steps)
+                                print(
+                                    "Skipping batch because no valid samples were selected after filtering."
+                                )
+                                continue
+
+                            suggested_factor = suggested_factor or current_sample_factor
                             logger.log(data=skip_metrics, step=self.global_steps)
                             print(
                                 f"[Oversampling] Selected {actual_input_ids_size} of {expected_input_ids_size} required samples. "
@@ -3465,6 +3474,21 @@ class RayKernelTrainer(RayPPOTrainer):
                             print(
                                 f"Filtered batch: {originl_len} -> {len(batch)} examples"
                             )
+
+                        if len(batch) == 0:
+                            logger.log(
+                                data={
+                                    "train/empty_batch_after_filter": 1.0,
+                                    "train/filtered_examples": int(
+                                        masked_examples.sum().item()
+                                    ),
+                                },
+                                step=self.global_steps,
+                            )
+                            print(
+                                "Skipping batch because all examples were filtered after response masking."
+                            )
+                            continue
 
                         # Pad by duplicating first N samples to make batch % max_world_size == 0
                         # Duplicated samples contribute same gradients (equivalent to increased sample weight)

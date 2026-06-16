@@ -124,9 +124,19 @@ def compute_kernel_reward_batch(solution_strs: list, ground_truths: list, entry_
         num_perf_trials = getattr(reward_config, "num_perf_trials")
         num_correct_trials = getattr(reward_config, "num_correct_trials")
         enable_profiling = getattr(reward_config, "enable_profiling")
+        # same_gpu_mode: suppress profiling during generation to avoid GPU contention.
+        # Bypass with _force_profiling=True (used per-turn in multi-turn agent loop
+        # so the LLM gets speedup feedback, and by the post-batch deferred profiling pass).
+        # _deferred_profiling kept as backward-compatible alias.
+        same_gpu_mode = getattr(reward_config, "same_gpu_mode", False)
+        force_profiling = kwargs.get("_force_profiling", False) or kwargs.get("_deferred_profiling", False)
+        if same_gpu_mode and not force_profiling:
+            enable_profiling = False
         verbose_errors = getattr(reward_config, "verbose_errors")
         detect_decoy_kernel = getattr(reward_config, "detect_decoy_kernel")
         reference_backend = getattr(reward_config, "reference_backend")
+        enable_ncu_profiling = getattr(reward_config, "enable_ncu_profiling", False)
+        ncu_metrics = getattr(reward_config, "ncu_metrics", None)
         
         for i, solution_str in enumerate(solution_strs):
             # reference_code = extract_reference_code(solution_str)
@@ -154,6 +164,8 @@ def compute_kernel_reward_batch(solution_strs: list, ground_truths: list, entry_
                 "verbose_errors": verbose_errors,
                 "detect_decoy_kernel": detect_decoy_kernel,
                 "reference_backend": reference_backend,
+                "enable_ncu_profiling": enable_ncu_profiling,
+                "ncu_metrics": ncu_metrics,
             })
         
         # 同步调用异步函数

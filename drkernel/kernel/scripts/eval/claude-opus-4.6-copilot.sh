@@ -50,7 +50,7 @@ MODEL_PATH="${MODEL_NAME}"
 
 # --- Generation Parameters ---
 # For small-scale test: N_SAMPLES=1; for production: N_SAMPLES=8
-N_SAMPLES=1
+N_SAMPLES=8
 BATCH_SIZE=128
 TEMPERATURE=1.0
 TOP_P=0.95
@@ -93,6 +93,7 @@ OPENAI_TIMEOUT=180
 OPENAI_MAX_RETRIES=5
 # Conservative concurrency for free Copilot plan
 OPENAI_MAX_CONCURRENCY=5
+OPENAI_STREAM=False
 
 # Required headers for GitHub Copilot API
 OPENAI_EXTRA_HEADERS="{User-Agent: opencode/0.1, Openai-Intent: conversation-edits, x-initiator: user}"

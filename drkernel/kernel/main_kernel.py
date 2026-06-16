@@ -19,6 +19,7 @@ from functools import partial
 
 import hydra
 import ray
+import torch
 
 from .kernel_trainer import RayKernelTrainer
 from .constant import QWEN3CHATTEMPLATE
@@ -98,7 +99,9 @@ def run_ppo(config) -> None:
     os.environ["ENSURE_CUDA_VISIBLE_DEVICES"] = os.environ.get('CUDA_VISIBLE_DEVICES', '')
     if not ray.is_initialized():
         # this is for local ray cluster
+        local_num_gpus = torch.cuda.device_count()
         ray.init(
+            num_gpus=local_num_gpus,
             runtime_env={
                 'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN', 'VLLM_LOGGING_LEVEL': 'WARN'}
             }
