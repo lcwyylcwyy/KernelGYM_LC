@@ -32,8 +32,9 @@
 - 整个分支在 eval/给定 flag 下不可达（如 eval 模式 Dropout ≡ identity）
 - 算子链代数化简为常量（如 `x - x`、`x * 0`、`relu(-|y|) ≡ 0`）
 
-**做法**：直接 `return` 常量或 `expand` 的零步长缓冲区，**整个计算图跳过**。
-**陷阱**：必须**对所有合法输入恒成立**（数学恒等式），不是"benchmark 分布下多半成立"——后者是 gaming，禁止。先证恒等式，再写。
+**做法**：算出常量值后，**物理写满整个输出张量**（如 Triton fill 写满 numel，或 `torch.full`），返回真实物化张量。
+**🛑 红线：禁止返回非物化的零步长广播 view**（如 `seed.expand(shape)` 只写 1 元素再广播）。grader 现在检测并判 reward-hack（correctness=False + decoy）：输出张量若有 size>1 维上 stride==0，或物理 storage 远小于 numel，直接判作弊。这种"只写 1 元素骗计时"会让 speedup 虚高 10-100x 但被二次验证/物化打回原形——**不是真加速**。常量坍缩的真实收益是"省掉前面的 conv/norm 计算"，输出该写的 441MB 还得写（这才是诚实的 ~9x）。
+**陷阱**：恒等式必须**对所有合法输入恒成立**（数学恒等式），不是"benchmark 分布下多半成立"——后者是 gaming，禁止。先证恒等式，再写。
 
 ## 2. 数学归约化简 ★★★★★
 
