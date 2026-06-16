@@ -796,9 +796,12 @@ def _parse_claude_stdout(stdout: str) -> tuple[str, dict[str, Any]]:
 ANALYSIS_CWD = Path(
     os.getenv("KG_ANALYSIS_CWD", "/tmp/kernelgym_claude_analysis_cwd")
 )
+# gpu-kernel-analyzer dropped from auto-load: its diagnosis role duplicates
+# gpu-kernel-diag (which carries the diag_rules decision logic) and its deep-
+# explanation role duplicates gpu-kernel-learn; in the loop it was only
+# "consult if ambiguous". Disk files kept for interactive use.
 ANALYSIS_SKILLS = (
     "gpu-kernel-diag",
-    "gpu-kernel-analyzer",
     "kernel-opt-strategy",
 )
 
@@ -872,7 +875,7 @@ def build_analysis_prompt(
 ) -> str:
     compact = compact_eval_feedback(eval_result)
     pack_names = ", ".join(PACKS.keys())
-    return f"""Use the Skill tool to invoke the `gpu-kernel-diag` skill, then diagnose the GPU kernel below in dialog-diagnosis mode (you CANNOT run commands; all profiling data is provided here). Consult `gpu-kernel-analyzer` if you need the decision tree.
+    return f"""Use the Skill tool to invoke the `gpu-kernel-diag` skill, then diagnose the GPU kernel below in dialog-diagnosis mode (you CANNOT run commands; all profiling data is provided here). Follow its diag_rules decision logic.
 
 ## Problem
 {item.name} (KernelBench, Triton kernel vs torch_compile reference)
@@ -1011,8 +1014,8 @@ def build_strategy_prompt(
         skill_line = (
             "Use the Skill tool to invoke `kernel-opt-strategy` (confirm we are "
             "in EXPLOIT phase), then invoke `gpu-kernel-diag` to do NCU local "
-            "tuning of the hotspot kernel. Consult `gpu-kernel-analyzer` if a "
-            "metric signal is ambiguous."
+            "tuning of the hotspot kernel, following its diag_rules pattern "
+            "matching to localize the bottleneck."
         )
         ncu_section = (
             "## NCU metrics (hotspot kernel internals, per-kernel averages)\n"

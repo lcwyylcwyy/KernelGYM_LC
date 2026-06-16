@@ -133,8 +133,8 @@ description: KernelBench Triton 优化的两阶段策略编排。阶段1（方�
 | Skill | 角色 | 何时 |
 |-------|------|------|
 | **kernel-opt-strategy**（本） | 总策略：探索 vs 调优的相位决策 | 每轮，最先 |
-| `gpu-kernel-diag` | NCU 局部调优执行 | 阶段 2 |
-| `gpu-kernel-analyzer` | 指标深解（辅助 diag） | 阶段 2 信号模糊时 |
+| `gpu-kernel-diag` | NCU 局部调优执行（含 diag_rules 决策逻辑）| 阶段 2 |
+| `gpu-kernel-analyzer` | 指标深解（与 diag 重叠，**不进自动循环**，仅交互用）| — |
 | `gpu-kernel-learn` | 指标硬件机制教学 | 不进自动循环 |
 
 <!-- v1 2026-06-13：两阶段策略，源自 fastp@1.2 96题方法对照 + p7 NCU锚定实测 -->
